@@ -17,17 +17,22 @@ export class GoalRepository {
     const result = await supabaseAdmin.from("goals").insert({ user_id:userId,title:goal.title,category:goal.category,period:goal.period,progress:goal.progress,start_date:goal.startDate,target_date:goal.targetDate,reminder_enabled:goal.reminderEnabled,notification_preference:goal.notificationPreference }).select("id").single();
     assertDatabaseResult(result.error);
     const habits = selectedHabits.map((habit: any) => ({ goal_id:result.data!.id,user_id:userId,title:habit.title,duration:habit.duration,difficulty:habit.difficulty,time_range:habit.schedule.timeRange,reminder_time:habit.schedule.reminderTime||null,active_days:habit.schedule.activeDays,priority:habit.schedule.priority }));
-    const habitResult = await supabaseAdmin.from("habits").insert(habits); assertDatabaseResult(habitResult.error);
+    const habitResult = await supabaseAdmin.from("habits").insert(habits);
+    if (habitResult.error) {
+      await supabaseAdmin.from("goals").delete().eq("id", result.data!.id).eq("user_id", userId);
+      assertDatabaseResult(habitResult.error);
+    }
     return this.find(userId, result.data!.id);
   }
   async update(userId: string, id: string, input: any) {
+    await this.find(userId, id);
     const payload: Record<string, unknown> = {}; const map: Record<string,string> = {title:"title",category:"category",period:"period",progress:"progress",startDate:"start_date",targetDate:"target_date",reminderEnabled:"reminder_enabled",notificationPreference:"notification_preference"};
     for (const [key,column] of Object.entries(map)) if (input[key] !== undefined) payload[column] = input[key];
     payload.updated_at = new Date().toISOString();
     const result = await supabaseAdmin.from("goals").update(payload).eq("user_id", userId).eq("id", id); assertDatabaseResult(result.error);
     return this.find(userId, id);
   }
-  async remove(userId: string, id: string) { const result = await supabaseAdmin.from("goals").delete().eq("user_id", userId).eq("id", id); assertDatabaseResult(result.error); }
+  async remove(userId: string, id: string) { await this.find(userId,id); const result = await supabaseAdmin.from("goals").delete().eq("user_id", userId).eq("id", id); assertDatabaseResult(result.error); }
 }
 
 export class UserRepository {
@@ -38,6 +43,21 @@ export class UserRepository {
 }
 
 export class DashboardRepository {
+  async setCompletion(userId: string, habitId: string, completed: boolean, completionDate?: string) {
+    const habit = await supabaseAdmin.from("habits").select("id").eq("id", habitId).eq("user_id", userId).maybeSingle();
+    assertDatabaseResult(habit.error);
+    if (!habit.data) throw new AppError("Habit not found.", 404);
+    const result = await supabaseAdmin.from("habit_completions").upsert({
+      habit_id: habitId,
+      user_id: userId,
+      completion_date: completionDate ?? new Date().toISOString().slice(0, 10),
+      completed,
+      completed_at: new Date().toISOString(),
+    }, { onConflict: "habit_id,completion_date" }).select("*").single();
+    assertDatabaseResult(result.error);
+    return result.data;
+  }
+
   async today(userId: string) {
     const goals = await new GoalRepository().list(userId);
     const today = new Date().toISOString().slice(0, 10);
@@ -61,6 +81,11 @@ export class DashboardRepository {
 }
 
 export class CoachRepository {
+  private async assertSessionOwner(userId: string, sessionId: string) {
+    const result = await supabaseAdmin.from("coach_sessions").select("id").eq("id", sessionId).eq("user_id", userId).maybeSingle();
+    assertDatabaseResult(result.error);
+    if (!result.data) throw new AppError("Coach session not found.", 404);
+  }
   async sessions(userId: string) {
     const result = await supabaseAdmin.from("coach_sessions").select("id,title,created_at,updated_at").eq("user_id", userId).order("updated_at", { ascending: false });
     assertDatabaseResult(result.error); return result.data ?? [];
@@ -70,10 +95,12 @@ export class CoachRepository {
     assertDatabaseResult(result.error); return result.data;
   }
   async messages(userId: string, sessionId: string) {
+    await this.assertSessionOwner(userId, sessionId);
     const result = await supabaseAdmin.from("coach_messages").select("id,role,content,created_at").eq("user_id", userId).eq("session_id", sessionId).order("created_at");
     assertDatabaseResult(result.error); return result.data ?? [];
   }
   async addMessage(userId: string, sessionId: string, role: string, content: string) {
+    await this.assertSessionOwner(userId, sessionId);
     const result = await supabaseAdmin.from("coach_messages").insert({ user_id:userId,session_id:sessionId,role,content }).select("*").single();
     assertDatabaseResult(result.error);
     await supabaseAdmin.from("coach_sessions").update({ updated_at: new Date().toISOString() }).eq("id", sessionId).eq("user_id", userId);

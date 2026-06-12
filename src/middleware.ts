@@ -2,7 +2,7 @@ import type { ErrorRequestHandler, RequestHandler } from "express";
 import { ZodError } from "zod";
 import { config } from "./config.js";
 import { AppError } from "./errors.js";
-import { supabaseAdmin } from "./supabase.js";
+import { supabaseAuth } from "./supabase.js";
 
 declare global {
   namespace Express {
@@ -14,7 +14,7 @@ export const resolveUser: RequestHandler = async (req, _res, next) => {
   try {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
     if (token) {
-      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      const { data, error } = await supabaseAuth.auth.getUser(token);
       if (error || !data.user) throw new AppError("Invalid or expired access token.", 401);
       req.userId = data.user.id;
     } else if (config.defaultUserId) req.userId = config.defaultUserId;

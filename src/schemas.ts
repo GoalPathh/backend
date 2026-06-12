@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const authSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
 export const registerSchema = authSchema.extend({ name: z.string().min(2).max(80) });
+export const refreshSessionSchema = z.object({ refreshToken: z.string().min(1) });
 export const habitSchema = z.object({
   id: z.string().optional(), title: z.string().min(1).max(120), duration: z.number().int().min(1).max(1440),
   difficulty: z.enum(["easy", "medium", "hard"]),
@@ -20,3 +21,4 @@ export const preferencesSchema = z.object({
   appearance: z.enum(["light", "dark", "system"]).optional(),
   notifications: z.array(z.object({ id: z.string(), title: z.string(), enabled: z.boolean(), description: z.string() })).optional(),
 });
+export const completionSchema = z.object({ completed: z.boolean(), completionDate: z.string().date().optional() });
