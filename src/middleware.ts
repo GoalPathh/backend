@@ -17,7 +17,8 @@ export const resolveUser: RequestHandler = async (req, _res, next) => {
       const { data, error } = await supabaseAuth.auth.getUser(token);
       if (error || !data.user) throw new AppError("Invalid or expired access token.", 401);
       req.userId = data.user.id;
-    } else if (config.defaultUserId) req.userId = config.defaultUserId;
+    }
+    // SECURE: Removed config.defaultUserId bypass
     next();
   } catch (error) { next(error); }
 };
