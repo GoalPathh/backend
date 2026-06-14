@@ -22,3 +22,33 @@ export const preferencesSchema = z.object({
   notifications: z.array(z.object({ id: z.string(), title: z.string(), enabled: z.boolean(), description: z.string() })).optional(),
 });
 export const completionSchema = z.object({ completed: z.boolean(), completionDate: z.string().date().optional() });
+
+// ── Interactive Goal Wizard payload (sent when chat message is tagged [goal_finalized]) ──
+// All fields optional on the SCHEMA side so we can give the user a clear error
+// instead of a generic 400. The route handler enforces required fields explicitly.
+export const wizardHabitSchema = z.object({
+  title: z.string().min(1).max(120),
+  difficulty: z.enum(["easy", "medium", "hard"]),
+  duration_minutes: z.number().int().min(1).max(1440),
+});
+
+export const wizardGoalPayloadSchema = z.object({
+  title: z.string().min(1).max(160).optional(),
+  category: z.enum(["language", "fitness", "skills", "creativity", "learning", "other"]).optional(),
+  duration: z.enum(["1month", "3months", "6months", "1year"]).optional(),
+  habits: z.array(wizardHabitSchema).max(5).optional().default([]),
+  schedule: z.object({
+    activeDays: z.array(z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"])).max(7).optional().default([]),
+    reminderTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  }).optional(),
+  notifications: z.enum(["all", "important", "none"]).optional().default("all"),
+  milestones: z.array(
+    z.object({
+      title: z.string().min(3).max(200),
+      target_date: z.string().datetime().optional(),
+      sort_order: z.number().int().min(0).max(20).optional(),
+    })
+  ).max(12).optional(),
+}).passthrough();
+
+export const GOAL_WIZARD_TAG = "[goal_finalized]";
