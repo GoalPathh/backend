@@ -1,10 +1,21 @@
 import { supabaseAuth } from "./supabase.js";
+import { config } from "./config.js";
 import { AppError } from "./errors.js";
 import { CoachRepository, DashboardRepository, GoalRepository, MilestoneRepository, UserRepository } from "./repositories.js";
 export class AuthService {
   async register(input:{email:string;password:string;name:string}) { const {data,error}=await supabaseAuth.auth.signUp({email:input.email,password:input.password,options:{data:{name:input.name}}}); if(error) throw new AppError(error.message,400); return data; }
   async login(input:{email:string;password:string}) { const {data,error}=await supabaseAuth.auth.signInWithPassword(input); if(error) throw new AppError(error.message,401); return data; }
   async refresh(refreshToken:string) { const {data,error}=await supabaseAuth.auth.refreshSession({refresh_token:refreshToken}); if(error) throw new AppError(error.message,401); return data; }
+  async googleOAuth(next:string) {
+    const redirectTo = new URL("/auth/callback", config.frontendUrl);
+    redirectTo.searchParams.set("next", next);
+    const { data, error } = await supabaseAuth.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: redirectTo.toString(), skipBrowserRedirect: true },
+    });
+    if (error) throw new AppError(error.message, 400);
+    return { url: data.url };
+  }
 }
 export class GoalService { constructor(private repo=new GoalRepository()){} list(u:string){return this.repo.list(u)} get(u:string,id:string){return this.repo.find(u,id)} create(u:string,i:unknown){return this.repo.create(u,i)} update(u:string,id:string,i:unknown){return this.repo.update(u,id,i)} remove(u:string,id:string){return this.repo.remove(u,id)} }
 export class UserService { constructor(private repo=new UserRepository()){} profile(u:string){return this.repo.profile(u)} updateProfile(u:string,i:unknown){return this.repo.updateProfile(u,i)} preferences(u:string){return this.repo.preferences(u)} updatePreferences(u:string,i:unknown){return this.repo.updatePreferences(u,i)} }

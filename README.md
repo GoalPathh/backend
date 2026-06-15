@@ -16,7 +16,7 @@ Authenticated requests use `Authorization: Bearer <supabase-access-token>`. `DEF
 
 ## Main routes
 
-- `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`
+- `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/google`
 - `GET|POST /goals`, `GET|PATCH|DELETE /goals/:id`
 - `GET /today`, `GET /progress`
 - `PUT /habits/:id/completion`

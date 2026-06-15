@@ -6,6 +6,7 @@ import {
   completionSchema,
   goalSchema,
   GOAL_WIZARD_TAG,
+  oauthSchema,
   preferencesSchema,
   profileSchema,
   refreshSessionSchema,
@@ -24,6 +25,7 @@ apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api"
 apiRouter.post("/auth/register",async(q,r)=>r.status(201).json({data:await auth.register(registerSchema.parse(q.body))}));
 apiRouter.post("/auth/login",async(q,r)=>r.json({data:await auth.login(authSchema.parse(q.body))}));
 apiRouter.post("/auth/refresh",async(q,r)=>r.json({data:await auth.refresh(refreshSessionSchema.parse(q.body).refreshToken)}));
+apiRouter.post("/auth/google",async(q,r)=>r.json({data:await auth.googleOAuth(oauthSchema.parse(q.body).next)}));
 apiRouter.get("/goals",requireUser,async(q,r)=>r.json({data:await goals.list(q.userId!)}));
 apiRouter.get("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.get(q.userId!,id.parse(q.params.id))}));
 apiRouter.post("/goals",requireUser,async(q,r)=>r.status(201).json({data:await goals.create(q.userId!,goalSchema.parse(q.body))}));
