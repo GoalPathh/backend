@@ -1,10 +1,26 @@
 import { Router } from "express";
 import { z } from "zod";
 import { requireUser } from "./middleware.js";
-import { authSchema, completionSchema, goalSchema, preferencesSchema, profileSchema, refreshSessionSchema, registerSchema, updateGoalSchema } from "./schemas.js";
-import { AuthService, CoachService, DashboardService, GoalService, UserService } from "./services.js";
-export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),coach=new CoachService(); const id=z.string().uuid();
-apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api"}}));
+import {
+  authSchema,
+  completionSchema,
+  goalSchema,
+  GOAL_WIZARD_TAG,
+  preferencesSchema,
+  profileSchema,
+  refreshSessionSchema,
+  registerSchema,
+  updateGoalSchema,
+  wizardGoalPayloadSchema,
+} from "./schemas.js";
+import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, UserService } from "./services.js";
+import { agentChat, agentSuggestMilestones } from "./llm-client.js";
+import { currentDriver } from "./llm-dispatcher.js";
+import { GoalRepository } from "./repositories.js";
+import { AppError } from "./errors.js";
+
+export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),coach=new CoachService(),milestones=new MilestoneService(); const id=z.string().uuid();
+apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
 apiRouter.post("/auth/register",async(q,r)=>r.status(201).json({data:await auth.register(registerSchema.parse(q.body))}));
 apiRouter.post("/auth/login",async(q,r)=>r.json({data:await auth.login(authSchema.parse(q.body))}));
 apiRouter.post("/auth/refresh",async(q,r)=>r.json({data:await auth.refresh(refreshSessionSchema.parse(q.body).refreshToken)}));
@@ -19,8 +35,185 @@ apiRouter.get("/me/preferences",requireUser,async(q,r)=>r.json({data:await users
 apiRouter.patch("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.updatePreferences(q.userId!,preferencesSchema.parse(q.body))}));
 apiRouter.get("/today",requireUser,async(q,r)=>r.json({data:await dashboard.today(q.userId!)}));
 apiRouter.put("/habits/:id/completion",requireUser,async(q,r)=>{const input=completionSchema.parse(q.body);r.json({data:await dashboard.setCompletion(q.userId!,id.parse(q.params.id),input.completed,input.completionDate)})});
-apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.progress(q.userId!)}));
+apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.getUserContextSnapshot(q.userId!)}));
+apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
+apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashboard.goalPerformance(q.userId!)}));
+apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
 apiRouter.get("/coach/sessions",requireUser,async(q,r)=>r.json({data:await coach.sessions(q.userId!)}));
 apiRouter.post("/coach/sessions",requireUser,async(q,r)=>r.status(201).json({data:await coach.createSession(q.userId!,z.object({title:z.string().min(1).max(120).optional()}).parse(q.body).title)}));
 apiRouter.get("/coach/sessions/:id/messages",requireUser,async(q,r)=>r.json({data:await coach.messages(q.userId!,id.parse(q.params.id))}));
-apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{const input=z.object({role:z.enum(["user","assistant"]).default("user"),content:z.string().min(1).max(5000)}).parse(q.body);r.status(201).json({data:await coach.addMessage(q.userId!,id.parse(q.params.id),input.role,input.content)})});
+
+// ── Coach message endpoint ──
+apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
+  const userId = q.userId!;
+  const sessionId = id.parse(q.params.id);
+  const input = z.object({
+    role: z.enum(["user","assistant"]).default("user"),
+    content: z.string().min(1).max(20000)
+  }).parse(q.body);
+
+  // 0. Detect interactive Goal Wizard submit (skip LLM, persist directly)
+  if (input.content.startsWith(GOAL_WIZARD_TAG)) {
+    try {
+      const jsonPart = input.content.slice(GOAL_WIZARD_TAG.length).trim();
+      let parsed: unknown;
+      try { parsed = JSON.parse(jsonPart); }
+      catch { throw new AppError("Wizard payload is not valid JSON.", 400); }
+
+      const payload = wizardGoalPayloadSchema.parse(parsed);
+
+      // Backend-level required-field check
+      const activeDays = payload.schedule?.activeDays ?? [];
+      if (!payload.duration) throw new AppError("Wizard payload missing required field: duration", 400);
+      if (!payload.habits || payload.habits.length === 0) {
+        throw new AppError("Wizard payload requires at least 1 habit", 400);
+      }
+      if (activeDays.length === 0) {
+        throw new AppError("Wizard payload requires at least 1 active day in schedule", 400);
+      }
+
+      let durationDays = 90;
+      if (payload.duration === "1month") durationDays = 30;
+      else if (payload.duration === "6months") durationDays = 180;
+      else if (payload.duration === "1year") durationDays = 365;
+
+      const startDate = new Date().toISOString();
+      const targetDate = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+
+      const title = payload.title?.trim() && payload.title.trim().length >= 2
+        ? payload.title.trim()
+        : payload.habits[0]!.title;
+
+      const category = payload.category ?? "other";
+
+      const goalRepo = new GoalRepository();
+      const created = await goalRepo.create(userId, {
+        title,
+        category,
+        period: payload.duration,
+        progress: 0,
+        startDate,
+        targetDate,
+        reminderEnabled: true,
+        notificationPreference: payload.notifications,
+        selectedHabits: payload.habits.map((h) => ({
+          title: h.title,
+          duration: h.duration_minutes,
+          difficulty: h.difficulty,
+          schedule: {
+            timeRange: payload.schedule?.reminderTime ? "evening" : "anytime",
+            reminderTime: payload.schedule?.reminderTime || null,
+            activeDays: activeDays,
+            priority: "medium" as const,
+          },
+        })),
+        selectedMilestones: Array.isArray(payload.milestones)
+          ? payload.milestones.slice(0, 12).map((m: any, idx: number) => ({
+              title: String(m.title ?? "").trim(),
+              target_date: m.target_date ?? null,
+              sort_order: typeof m.sort_order === "number" ? m.sort_order : idx,
+            })).filter((m: any) => m.title.length >= 3)
+          : [],
+      });
+
+      await coach.addMessage(userId, sessionId, "user", input.content);
+      const habitSummary = payload.habits.map(h => `• ${h.title} (${h.duration_minutes}m, ${h.difficulty})`).join("\n");
+      const daySummary = activeDays.join(", ");
+      const reply = `🎯 Goal "${(created as any).title}" berhasil dibuat!\n\nKebiasaan:\n${habitSummary}\n\nAktif: ${daySummary}${payload.schedule?.reminderTime ? ` • ${payload.schedule.reminderTime}` : ""}`;
+      const assistantMsg = await coach.addMessage(userId, sessionId, "assistant", reply);
+      return r.status(201).json({ data: assistantMsg });
+    } catch (err) {
+      console.error("[Wizard] Error:", err);
+      await coach.addMessage(userId, sessionId, "assistant",
+        err instanceof Error ? `Wizard error: ${err.message}. Please try the wizard again with all required fields.` : "Wizard error: unknown."
+      );
+      throw err;
+    }
+  }
+
+  // 1. Persist user message
+  await coach.addMessage(userId, sessionId, input.role, input.content);
+
+  // 2. Fetch history & RAG context
+  const history = await coach.messages(userId, sessionId);
+  const context = await dashboard.getUserContextSnapshot(userId);
+
+  // 3. Build messages for LLM (last 10 exchanges)
+  const messages = history.slice(-11).map(m => ({
+    role: m.role === "assistant" ? "assistant" : "user",
+    content: m.content
+  }));
+
+  const systemPrompt = `You are a smart AI Coach for GoalPath.
+You help users plan goals and maintain habits.
+Current User Data (STRICT SOURCE OF TRUTH):
+${JSON.stringify(context, null, 2)}
+Rules:
+- DO NOT hallucinate dates or progress.
+- When user expresses INTENT to set up a new goal (eg. "bikin goal baru", "I want to track", "mau mulai fitness 3 bulan", "let's set a goal", "set up a goal", "saya mau belajar Spanish"), call the start_goal_wizard tool — even if some details are missing. Pass any details the user mentioned as parameters; leave others null. After this tool call, briefly tell the user you'll open the wizard.
+- Otherwise, when the goal is mostly planned and you have title + category, call the createGoal tool directly.
+- When user wants to update a goal, call the updateGoal tool.
+- When you need to ask user for duration/days/difficulty of a habit, call requestHabitParameters tool.
+- Keep responses encouraging and concise.
+- Always respond in the same language the user writes in.`;
+
+  try {
+    const aiText = await agentChat(systemPrompt, messages, userId);
+    const assistantMsg = await coach.addMessage(userId, sessionId, "assistant", aiText);
+    return r.status(201).json({ data: assistantMsg });
+  } catch (err: any) {
+    console.error("AI Error:", err.message);
+    const fallback = "I'm having a brief connection hiccup. Could you try sending that again?";
+    const assistantMsg = await coach.addMessage(userId, sessionId, "assistant", fallback);
+    r.status(201).json({ data: assistantMsg });
+  }
+});
+
+// ── Milestone routes ──
+const suggestMilestonesBodySchema = z.object({
+  goalTitle: z.string().min(2).max(160),
+  category: z.string().max(40).optional(),
+  duration: z.string().max(20).optional(),
+  habits: z.array(z.object({ title: z.string(), difficulty: z.string().optional() })).max(20).optional(),
+});
+apiRouter.post("/milestones/suggest", requireUser, async (q, r) => {
+  const body = suggestMilestonesBodySchema.parse(q.body);
+  const milestones = await agentSuggestMilestones(body);
+  return r.json({ data: { milestones, source: "ai+fallback" } });
+});
+
+const milestoneItemSchema = z.object({
+  title: z.string().min(3).max(200),
+  target_date: z.string().datetime().optional(),
+  sort_order: z.number().int().min(0).max(20).optional(),
+});
+const milestonesBulkSchema = z.object({
+  milestones: z.array(milestoneItemSchema).min(1).max(12),
+});
+apiRouter.put("/goals/:id/milestones", requireUser, async (q, r) => {
+  const userId = q.userId!;
+  const goalId = id.parse(q.params.id);
+  await new GoalRepository().find(userId, goalId); // owner check
+  const body = milestonesBulkSchema.parse(q.body);
+  const rows = await milestones.bulkReplace(userId, goalId, body.milestones);
+  return r.json({ data: rows });
+});
+
+apiRouter.patch("/goals/:id/milestones/:milestoneId", requireUser, async (q, r) => {
+  const userId = q.userId!;
+  const goalId = id.parse(q.params.id);
+  const milestoneId = id.parse(q.params.milestoneId);
+  const body = z.object({ completed: z.boolean() }).parse(q.body);
+  const updated = await milestones.setDone(userId, milestoneId, body.completed);
+  // Recompute progress explicitly (trigger should handle it, but explicit doesn't hurt)
+  await dashboard.recomputeGoal(userId, goalId);
+  return r.json({ data: updated });
+});
+
+apiRouter.get("/goals/:id/milestones", requireUser, async (q, r) => {
+  const userId = q.userId!;
+  const goalId = id.parse(q.params.id);
+  await new GoalRepository().find(userId, goalId); // owner check
+  const rows = await milestones.listOf(userId, goalId);
+  return r.json({ data: rows });
+});

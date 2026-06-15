@@ -1,6 +1,13 @@
 import { AppError, assertDatabaseResult } from "./errors.js";
 import { supabaseAdmin } from "./supabase.js";
 
+/** Days between two YYYY-MM-DD dates (b - a). Naive calendar difference. */
+function daysBetween(a: string, b: string): number {
+  const da = new Date(a + "T00:00:00Z").getTime();
+  const db = new Date(b + "T00:00:00Z").getTime();
+  return Math.floor((db - da) / (1000 * 60 * 60 * 24));
+}
+
 const selectGoal = "id,title,category,period,progress,start_date,target_date,reminder_enabled,notification_preference,created_at,updated_at,habits(id,title,duration,difficulty,time_range,reminder_time,active_days,priority,created_at)";
 
 export class GoalRepository {
@@ -13,16 +20,26 @@ export class GoalRepository {
     assertDatabaseResult(result.error); if (!result.data) throw new AppError("Goal not found.", 404); return result.data;
   }
   async create(userId: string, input: any) {
-    const { selectedHabits, ...goal } = input;
+    const { selectedHabits, selectedMilestones, ...goal } = input;
     const result = await supabaseAdmin.from("goals").insert({ user_id:userId,title:goal.title,category:goal.category,period:goal.period,progress:goal.progress,start_date:goal.startDate,target_date:goal.targetDate,reminder_enabled:goal.reminderEnabled,notification_preference:goal.notificationPreference }).select("id").single();
     assertDatabaseResult(result.error);
-    const habits = selectedHabits.map((habit: any) => ({ goal_id:result.data!.id,user_id:userId,title:habit.title,duration:habit.duration,difficulty:habit.difficulty,time_range:habit.schedule.timeRange,reminder_time:habit.schedule.reminderTime||null,active_days:habit.schedule.activeDays,priority:habit.schedule.priority }));
+    const goalId = result.data!.id;
+    const habits = selectedHabits.map((habit: any) => ({ goal_id:goalId,user_id:userId,title:habit.title,duration:habit.duration,difficulty:habit.difficulty,time_range:habit.schedule.timeRange,reminder_time:habit.schedule.reminderTime||null,active_days:habit.schedule.activeDays,priority:habit.schedule.priority }));
     const habitResult = await supabaseAdmin.from("habits").insert(habits);
     if (habitResult.error) {
-      await supabaseAdmin.from("goals").delete().eq("id", result.data!.id).eq("user_id", userId);
+      await supabaseAdmin.from("goals").delete().eq("id", goalId).eq("user_id", userId);
       assertDatabaseResult(habitResult.error);
     }
-    return this.find(userId, result.data!.id);
+    if (selectedMilestones && selectedMilestones.length > 0) {
+      const milestoneRows = selectedMilestones.map((m: any, idx: number) => ({
+        user_id: userId, goal_id: goalId,
+        title: (m.title ?? "").toString().trim(),
+        target_date: m.target_date ?? null,
+        sort_order: typeof m.sort_order === "number" ? m.sort_order : idx,
+      }));
+      await supabaseAdmin.from("goal_milestones").insert(milestoneRows);
+    }
+    return this.find(userId, goalId);
   }
   async update(userId: string, id: string, input: any) {
     await this.find(userId, id);
@@ -43,8 +60,149 @@ export class UserRepository {
 }
 
 export class DashboardRepository {
+  /** Recompute goal.progress in-app from habit_completions.
+   *  Formula: (completed_count since start_date) / (habits_count * days_since_start) * 100
+   *  Idempotent — safe to call after every completion change.
+   */
+  async recomputeGoalProgress(userId: string, goalId: string): Promise<number> {
+    const { data: goal, error: gErr } = await supabaseAdmin
+      .from("goals")
+      .select("id, start_date")
+      .eq("user_id", userId)
+      .eq("id", goalId)
+      .maybeSingle();
+    assertDatabaseResult(gErr);
+    if (!goal) return 0;
+
+    const { count: habitsCount, error: hErr } = await supabaseAdmin
+      .from("habits")
+      .select("id", { count: "exact", head: true })
+      .eq("goal_id", goalId);
+    assertDatabaseResult(hErr);
+
+    const habitCount = habitsCount ?? 0;
+    if (habitCount === 0) {
+      await supabaseAdmin.from("goals").update({ progress: 0, updated_at: new Date().toISOString() }).eq("id", goalId);
+      return 0;
+    }
+
+    const startDay = goal.start_date.slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    const eligibleDays = Math.max(1, daysBetween(startDay, today) + 1);
+
+    const { count: doneCount, error: cErr } = await supabaseAdmin
+      .from("habit_completions")
+      .select("id", { count: "exact", head: true })
+      .eq("completed", true)
+      .gte("completion_date", startDay)
+      .lte("completion_date", today)
+      .in("habit_id", (await supabaseAdmin.from("habits").select("id").eq("goal_id", goalId)).data?.map((h: any) => h.id) ?? ["00000000-0000-0000-0000-000000000000"]);
+    assertDatabaseResult(cErr);
+
+    const expected = habitCount * eligibleDays;
+    const newProgress = Math.min(100, Number(((doneCount ?? 0) / expected * 100).toFixed(2)));
+
+    await supabaseAdmin
+      .from("goals")
+      .update({ progress: newProgress, updated_at: new Date().toISOString() })
+      .eq("id", goalId);
+
+    return newProgress;
+  }
+
+  /** Compute progress-style stats for the progress page (current_goals_count, completed_habits_7d, etc.).
+   *  Replaces hardcoded mock expectations on the frontend.
+   */
+  async getProgressDash(userId: string) {
+    // habits total completed last 7 days
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const { count: completedLast7 } = await supabaseAdmin
+      .from("habit_completions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("completed", true)
+      .gte("completion_date", sevenDaysAgo);
+    const { count: missedLast7 } = await supabaseAdmin
+      .from("habit_completions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("completed", false)
+      .gte("completion_date", sevenDaysAgo);
+    const { count: totalCompletions } = await supabaseAdmin
+      .from("habit_completions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("completed", true);
+    const { data: goals } = await supabaseAdmin
+      .from("goals")
+      .select("id, progress")
+      .eq("user_id", userId);
+    const activeGoals = goals?.length ?? 0;
+    // Naive streak: distinct dates with completed=true going back from today
+    const { data: streakRows } = await supabaseAdmin
+      .from("habit_completions")
+      .select("completion_date")
+      .eq("user_id", userId)
+      .eq("completed", true)
+      .order("completion_date", { ascending: false })
+      .limit(60);
+    let streak = 0;
+    if (streakRows && streakRows.length > 0) {
+      const dates = new Set<string>((streakRows as any[]).map(r => r.completion_date));
+      for (let i = 0; ; i++) {
+        const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        if (dates.has(d)) streak++;
+        else break;
+        if (streak > 60) break;
+      }
+    }
+    const totalXp = (totalCompletions ?? 0) * 30; // simple XP model: 30 XP per completion
+    const completionRate = ((completedLast7 ?? 0) + (missedLast7 ?? 0)) > 0
+      ? Math.round(((completedLast7 ?? 0) / ((completedLast7 ?? 0) + (missedLast7 ?? 0))) * 100)
+      : 0;
+    const profile = await supabaseAdmin.from("profiles").select("xp, streak_days, level").eq("id", userId).maybeSingle();
+    return {
+      activeGoals,
+      habitsCompleted7d: completedLast7 ?? 0,
+      habitsMissed7d: missedLast7 ?? 0,
+      totalCompletions: totalCompletions ?? 0,
+      currentStreak: streak,
+      totalXp,
+      completionRate,
+      profile: profile?.data ?? { xp: totalXp, streak_days: streak, level: 1 },
+    };
+  }
+
+  /** Per-goal real performance numbers — built off goals.progress (now auto-recomputed). */
+  async getGoalPerformance(userId: string) {
+    const { data: goals } = await supabaseAdmin
+      .from("goals")
+      .select("id, title, target_date, progress, start_date")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+    if (!goals) return [];
+    const today = Date.now();
+    return (goals as any[]).map((g, idx) => {
+      const target = new Date(g.target_date).getTime();
+      const daysLeft = Math.floor((target - today) / (1000 * 60 * 60 * 24));
+      const pace = g.progress >= 100 ? "On Track"
+                  : daysLeft < 7 ? "At Risk"
+                  : g.progress >= 50 ? "On Track"
+                  : "Behind Schedule";
+      return {
+        id: g.id,
+        title: g.title,
+        progress: Number(g.progress),
+        targetDate: g.target_date,
+        status: pace,
+        color: "bg-primary",
+        daysLeft,
+      };
+    });
+  }
+
   async setCompletion(userId: string, habitId: string, completed: boolean, completionDate?: string) {
-    const habit = await supabaseAdmin.from("habits").select("id").eq("id", habitId).eq("user_id", userId).maybeSingle();
+    const habit = await supabaseAdmin.from("habits").select("id, goal_id").eq("id", habitId).eq("user_id", userId).maybeSingle();
     assertDatabaseResult(habit.error);
     if (!habit.data) throw new AppError("Habit not found.", 404);
     const result = await supabaseAdmin.from("habit_completions").upsert({
@@ -55,6 +213,17 @@ export class DashboardRepository {
       completed_at: new Date().toISOString(),
     }, { onConflict: "habit_id,completion_date" }).select("*").single();
     assertDatabaseResult(result.error);
+
+    // Auto-recompute parent goal.progress (also fires SQL trigger on deployed env)
+    if (habit.data.goal_id) {
+      try {
+        await this.recomputeGoalProgress(userId, habit.data.goal_id);
+      } catch (e) {
+        console.error("[Dashboard] recompute fallback failed:", (e as Error).message);
+        // Non-fatal — completion saved successfully
+      }
+    }
+
     return result.data;
   }
 
@@ -66,16 +235,42 @@ export class DashboardRepository {
     return { date: today, goals, completions: completions.data ?? [] };
   }
 
-  async progress(userId: string) {
-    const goals = await new GoalRepository().list(userId);
-    const completions = await supabaseAdmin.from("habit_completions").select("habit_id,completion_date,completed").eq("user_id", userId).order("completion_date", { ascending: false }).limit(365);
-    assertDatabaseResult(completions.error);
-    const completed = (completions.data ?? []).filter((item) => item.completed).length;
-    const habitCount = goals.reduce((sum: number, goal: any) => sum + (goal.habits?.length ?? 0), 0);
+  async getUserContextSnapshot(userId: string) {
+    const today = new Date();
+    const sevenDaysAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    // 1. Get basic profile
+    const profileResult = await supabaseAdmin.from("profiles")
+      .select("level, xp, streak_days")
+      .eq("id", userId)
+      .single();
+    
+    // 2. Get active goals
+    const goalsResult = await supabaseAdmin.from("goals")
+      .select("id, title, category, progress")
+      .eq("user_id", userId);
+
+    // 3. Get habit completions for the last 7 days
+    const completionsResult = await supabaseAdmin.from("habit_completions")
+      .select("completed")
+      .eq("user_id", userId)
+      .gte("completion_date", sevenDaysAgo);
+
+    const profile = profileResult.data || { level: 1, xp: 0, streak_days: 0 };
+    const active_goals = goalsResult.data || [];
+    const completions = completionsResult.data || [];
+
+    const completed_count = completions.filter(c => c.completed).length;
+    const missed_count = completions.length - completed_count;
+
     return {
-      stats: { activeGoals: goals.length, habitsCompleted: completed, totalHabits: habitCount },
-      goals,
-      completions: completions.data ?? [],
+      profile,
+      active_goals_count: active_goals.length,
+      active_goals,
+      performance_last_7_days: {
+        completed_habits: completed_count,
+        missed_habits: missed_count
+      }
     };
   }
 }
@@ -105,5 +300,57 @@ export class CoachRepository {
     assertDatabaseResult(result.error);
     await supabaseAdmin.from("coach_sessions").update({ updated_at: new Date().toISOString() }).eq("id", sessionId).eq("user_id", userId);
     return result.data;
+  }
+}
+
+export class MilestoneRepository {
+  async list(userId: string, goalId: string) {
+    const result = await supabaseAdmin
+      .from("goal_milestones")
+      .select("id, goal_id, title, target_date, sort_order, completed_at, created_at")
+      .eq("user_id", userId)
+      .eq("goal_id", goalId)
+      .order("sort_order", { ascending: true });
+    assertDatabaseResult(result.error);
+    return result.data ?? [];
+  }
+
+  async bulkInsert(userId: string, goalId: string, items: Array<{ title: string; target_date?: string; sort_order?: number }>) {
+    if (!items || items.length === 0) return [];
+    const rows = items.map((m, idx) => ({
+      user_id: userId,
+      goal_id: goalId,
+      title: m.title.trim(),
+      target_date: m.target_date || null,
+      sort_order: m.sort_order ?? idx,
+    }));
+    const result = await supabaseAdmin
+      .from("goal_milestones")
+      .insert(rows)
+      .select("id, goal_id, title, target_date, sort_order, completed_at, created_at")
+      .order("sort_order", { ascending: true });
+    assertDatabaseResult(result.error);
+    return result.data ?? [];
+  }
+
+  async setDone(userId: string, milestoneId: string, done: boolean) {
+    const result = await supabaseAdmin
+      .from("goal_milestones")
+      .update({ completed_at: done ? new Date().toISOString() : null, updated_at: new Date().toISOString() })
+      .eq("user_id", userId)
+      .eq("id", milestoneId)
+      .select("*")
+      .single();
+    assertDatabaseResult(result.error);
+    return result.data;
+  }
+
+  async remove(userId: string, milestoneId: string) {
+    const result = await supabaseAdmin
+      .from("goal_milestones")
+      .delete()
+      .eq("user_id", userId)
+      .eq("id", milestoneId);
+    assertDatabaseResult(result.error);
   }
 }
