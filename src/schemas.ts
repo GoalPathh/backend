@@ -3,6 +3,8 @@ import { z } from "zod";
 export const authSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
 export const registerSchema = authSchema.extend({ name: z.string().min(2).max(80) });
 export const refreshSessionSchema = z.object({ refreshToken: z.string().min(1) });
+export const forgotPasswordSchema = z.object({ email: z.string().email() });
+export const updatePasswordSchema = z.object({ password: z.string().min(8) });
 export const oauthSchema = z.object({
   next: z.string().regex(/^\/(?!\/)/, "Next path must be an internal path.").default("/today"),
 });

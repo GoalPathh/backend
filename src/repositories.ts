@@ -275,6 +275,208 @@ export class DashboardRepository {
   }
 }
 
+type NotificationInput = {
+  type: "habit_reminder" | "missed_habit" | "streak" | "coach_tip" | "progress_update" | "goal_risk";
+  title: string;
+  message: string;
+  source_key: string;
+  notification_date: string;
+  metadata?: Record<string, unknown>;
+};
+
+const notificationDays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+function dateKey(date: Date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function isHabitScheduled(habit: any, day: string) {
+  const activeDays = Array.isArray(habit.active_days) ? habit.active_days : [];
+  return activeDays.length === 0 || activeDays.includes(day);
+}
+
+function shouldNotifyHabit(goal: any, habit: any) {
+  if (!goal.reminder_enabled || goal.notification_preference === "none") return false;
+  return goal.notification_preference === "all" || habit.priority === "high";
+}
+
+function timeRangeLabel(timeRange: string) {
+  if (timeRange === "morning") return "morning";
+  if (timeRange === "afternoon") return "afternoon";
+  if (timeRange === "evening") return "evening";
+  return "scheduled";
+}
+
+export class NotificationRepository {
+  private async upsertGenerated(userId: string, rows: NotificationInput[]) {
+    if (rows.length === 0) return;
+    const result = await supabaseAdmin
+      .from("notifications")
+      .upsert(
+        rows.map((row) => ({
+          user_id: userId,
+          ...row,
+          metadata: row.metadata ?? {},
+          updated_at: new Date().toISOString(),
+        })),
+        { onConflict: "user_id,type,source_key,notification_date", ignoreDuplicates: true },
+      );
+    assertDatabaseResult(result.error);
+  }
+
+  private async generateFlowNotifications(userId: string) {
+    const now = new Date();
+    const today = dateKey(now);
+    const yesterdayDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const yesterday = dateKey(yesterdayDate);
+    const todayDay = notificationDays[now.getDay()]!;
+    const yesterdayDay = notificationDays[yesterdayDate.getDay()]!;
+
+    const { data: goals, error: goalsError } = await supabaseAdmin
+      .from("goals")
+      .select("id,title,progress,target_date,reminder_enabled,notification_preference,updated_at,habits(id,title,duration,time_range,active_days,priority)")
+      .eq("user_id", userId)
+      .neq("notification_preference", "none")
+      .order("updated_at", { ascending: false });
+    assertDatabaseResult(goalsError);
+
+    const { data: todayCompletions, error: todayError } = await supabaseAdmin
+      .from("habit_completions")
+      .select("habit_id,completed")
+      .eq("user_id", userId)
+      .eq("completion_date", today);
+    assertDatabaseResult(todayError);
+
+    const { data: yesterdayCompletions, error: yesterdayError } = await supabaseAdmin
+      .from("habit_completions")
+      .select("habit_id,completed")
+      .eq("user_id", userId)
+      .eq("completion_date", yesterday);
+    assertDatabaseResult(yesterdayError);
+
+    const todayDone = new Map((todayCompletions ?? []).map((row: any) => [row.habit_id, row.completed]));
+    const yesterdayDone = new Map((yesterdayCompletions ?? []).map((row: any) => [row.habit_id, row.completed]));
+    const generated: NotificationInput[] = [];
+    const pendingToday: any[] = [];
+
+    for (const goal of goals ?? []) {
+      const habits = Array.isArray((goal as any).habits) ? (goal as any).habits : [];
+      for (const habit of habits) {
+        if (!shouldNotifyHabit(goal, habit)) continue;
+
+        if (isHabitScheduled(habit, todayDay) && todayDone.get(habit.id) !== true) {
+          pendingToday.push({ goal, habit });
+        }
+
+        if (isHabitScheduled(habit, yesterdayDay) && yesterdayDone.get(habit.id) !== true) {
+          generated.push({
+            type: "missed_habit",
+            title: `Missed: ${habit.title}`,
+            message: `You skipped this ${timeRangeLabel(habit.time_range)} habit yesterday. Restart with a smaller version today.`,
+            source_key: `habit:${habit.id}:missed`,
+            notification_date: today,
+            metadata: { habitId: habit.id, goalId: goal.id },
+          });
+        }
+      }
+
+      const progress = Number((goal as any).progress) || 0;
+      const targetDate = new Date((goal as any).target_date);
+      const daysLeft = Math.ceil((targetDate.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+
+      if (Number.isFinite(daysLeft) && daysLeft >= 0 && daysLeft <= 7 && progress < 70) {
+        generated.push({
+          type: "goal_risk",
+          title: `${(goal as any).title} needs attention`,
+          message: `${daysLeft} day${daysLeft === 1 ? "" : "s"} left and progress is ${Math.round(progress)}%. Consider adjusting the plan or finishing one key habit today.`,
+          source_key: `goal:${(goal as any).id}:risk`,
+          notification_date: today,
+          metadata: { goalId: (goal as any).id, progress, daysLeft },
+        });
+      }
+
+      if (String((goal as any).updated_at ?? "").slice(0, 10) === today && progress > 0) {
+        generated.push({
+          type: "progress_update",
+          title: "Progress Update",
+          message: `${(goal as any).title} is now at ${Math.round(progress)}%. Keep the next action realistic.`,
+          source_key: `goal:${(goal as any).id}:progress`,
+          notification_date: today,
+          metadata: { goalId: (goal as any).id, progress },
+        });
+      }
+    }
+
+    for (const item of pendingToday.slice(0, 4)) {
+      generated.push({
+        type: "habit_reminder",
+        title: item.habit.title,
+        message: `Your ${timeRangeLabel(item.habit.time_range)} habit is waiting. Keep it light and finish one small action.`,
+        source_key: `habit:${item.habit.id}:today`,
+        notification_date: today,
+        metadata: { habitId: item.habit.id, goalId: item.goal.id },
+      });
+    }
+
+    if (pendingToday.length > 0) {
+      generated.push({
+        type: "coach_tip",
+        title: "AI Coach Tip",
+        message: `Start with "${pendingToday[0]!.habit.title}". If energy is low, do the 2-minute version first.`,
+        source_key: "coach-tip:pending-habit",
+        notification_date: today,
+        metadata: { habitId: pendingToday[0]!.habit.id },
+      });
+    }
+
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from("profiles")
+      .select("streak_days")
+      .eq("id", userId)
+      .maybeSingle();
+    assertDatabaseResult(profileError);
+
+    const streak = Number(profile?.streak_days ?? 0);
+    if (streak >= 7) {
+      generated.push({
+        type: "streak",
+        title: `${streak} Day Streak`,
+        message: "You protected your streak. Keep the momentum with one small habit today.",
+        source_key: `streak:${streak}`,
+        notification_date: today,
+        metadata: { streak },
+      });
+    }
+
+    await this.upsertGenerated(userId, generated);
+  }
+
+  async list(userId: string) {
+    await this.generateFlowNotifications(userId);
+
+    const result = await supabaseAdmin
+      .from("notifications")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(20);
+    assertDatabaseResult(result.error);
+
+    return result.data ?? [];
+  }
+
+  async markAllRead(userId: string) {
+    const result = await supabaseAdmin
+      .from("notifications")
+      .update({ read_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("user_id", userId)
+      .is("read_at", null)
+      .select("*");
+    assertDatabaseResult(result.error);
+    return result.data ?? [];
+  }
+}
+
 export class CoachRepository {
   private async assertSessionOwner(userId: string, sessionId: string) {
     const result = await supabaseAdmin.from("coach_sessions").select("id").eq("id", sessionId).eq("user_id", userId).maybeSingle();
