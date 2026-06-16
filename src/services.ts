@@ -1,7 +1,9 @@
 import { supabaseAdmin, supabaseAuth } from "./supabase.js";
 import { config } from "./config.js";
 import { AppError } from "./errors.js";
-import { CoachRepository, DashboardRepository, GoalRepository, MilestoneRepository, NotificationRepository, UserRepository } from "./repositories.js";
+import { CoachRepository, DashboardRepository, GoalRepository, MilestoneRepository, NotificationRepository, PersonaRepository, UserRepository } from "./repositories.js";
+import { deriveAdvice } from "./services/personaClassifier.js";
+
 export class AuthService {
   async register(input:{email:string;password:string;name:string}) { const {data,error}=await supabaseAuth.auth.signUp({email:input.email,password:input.password,options:{data:{name:input.name}}}); if(error) throw new AppError(error.message,400); return data; }
   async login(input:{email:string;password:string}) { const {data,error}=await supabaseAuth.auth.signInWithPassword(input); if(error) throw new AppError(error.message,401); return data; }
@@ -33,4 +35,32 @@ export class UserService { constructor(private repo=new UserRepository()){} prof
 export class DashboardService { constructor(private repo=new DashboardRepository()){} today(u:string){return this.repo.today(u)} getUserContextSnapshot(u:string){return this.repo.getUserContextSnapshot(u)} setCompletion(u:string,id:string,c:boolean,d?:string){return this.repo.setCompletion(u,id,c,d)} progressDash(u:string){return this.repo.getProgressDash(u)} goalPerformance(u:string){return this.repo.getGoalPerformance(u)} recomputeGoal(u:string,id:string){return this.repo.recomputeGoalProgress(u,id)} }
 export class NotificationService { constructor(private repo=new NotificationRepository()){} list(u:string){return this.repo.list(u)} markAllRead(u:string){return this.repo.markAllRead(u)} }
 export class CoachService { constructor(private repo=new CoachRepository()){} sessions(u:string){return this.repo.sessions(u)} createSession(u:string,title?:string){return this.repo.createSession(u,title)} renameSession(u:string,id:string,title:string){return this.repo.renameSession(u,id,title)} deleteSession(u:string,id:string){return this.repo.deleteSession(u,id)} messages(u:string,id:string){return this.repo.messages(u,id)} addMessage(u:string,id:string,role:string,content:string){return this.repo.addMessage(u,id,role,content)} }
+export class PersonaService {
+  constructor(private repo = new PersonaRepository()) {}
+
+  async compute(u: string, windowDays: number, force = false) {
+    if (!force) {
+      const cached = await this.repo.getCached(u, windowDays, 60 * 60 * 1000);
+      if (cached) {
+        const traits = (cached as any).traits;
+        const evidence = (cached as any).evidence;
+        return {
+          archetype: (cached as any).archetype,
+          headline: "",
+          traits,
+          evidence,
+          advice: deriveAdvice((cached as any).archetype, traits, evidence),
+          generatedAt: (cached as any).computed_at,
+          windowDays: (cached as any).window_days,
+        };
+      }
+    }
+
+    return this.repo.compute(u, windowDays);
+  }
+
+  getCoachContext(u: string, windowDays = 14) {
+    return this.repo.getCoachContext(u, windowDays);
+  }
+}
 export class MilestoneService { constructor(private repo=new MilestoneRepository()){} listOf(u:string,goalId:string){return this.repo.list(u,goalId)} bulkReplace(u:string,goalId:string,items:Array<{title:string;target_date?:string;sort_order?:number}>){return this.repo.bulkInsert(u,goalId,items)} setDone(u:string,id:string,done:boolean){return this.repo.setDone(u,id,done)} remove(u:string,id:string){return this.repo.remove(u,id)} }

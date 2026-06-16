@@ -58,3 +58,9 @@ export const wizardGoalPayloadSchema = z.object({
 }).passthrough();
 
 export const GOAL_WIZARD_TAG = "[goal_finalized]";
+
+// ── Persona query params ──
+export const personaWindowDaysSchema = z.coerce.number().int().refine(
+  (n) => [7, 14, 30].includes(n),
+  { message: "windowDays must be one of 7, 14, 30" }
+).default(14);

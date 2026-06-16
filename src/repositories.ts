@@ -1,5 +1,17 @@
 import { AppError, assertDatabaseResult } from "./errors.js";
 import { supabaseAdmin } from "./supabase.js";
+import type {
+  PersonaArchetype,
+  PersonaFeatures,
+  PersonaEvidence,
+  PersonaAdvice,
+} from "./dto/persona.js";
+import { classifyArchetype, deriveAdvice, DEFAULT_HEADLINE } from "./services/personaClassifier.js";
+
+type Difficulty = "easy" | "medium" | "hard";
+
+function clampPct(n: number): number { return Math.max(0, Math.min(100, Math.round(n))); }
+function safeDiv(a: number, b: number): number { return b === 0 ? 0 : a / b; }
 
 /** Days between two YYYY-MM-DD dates (b - a). Naive calendar difference. */
 function daysBetween(a: string, b: string): number {
@@ -598,3 +610,208 @@ export class MilestoneRepository {
     assertDatabaseResult(result.error);
   }
 }
+
+
+
+/**
+ * PersonaRepository — deterministic scoring + classification.
+ * Aggregates habits, completions and milestones for a window-based
+ * archetype. Persists to persona_profiles (UPSERT) for cache reads.
+ */
+export class PersonaRepository {
+  async compute(userId: string, windowDays: number) {
+    const w = Math.max(1, Math.min(60, windowDays));
+    const today = new Date();
+    const since = new Date(today.getTime() - w * 24 * 60 * 60 * 1000);
+    const sinceDate = since.toISOString().slice(0, 10);
+
+    const { data: allHabits } = await supabaseAdmin
+      .from("habits")
+      .select("id, goal_id, difficulty, created_at")
+      .eq("user_id", userId);
+    const habits = (allHabits ?? []) as Array<{ id: string; goal_id: string; difficulty: string; created_at: string }>;
+
+    const { data: allGoals } = await supabaseAdmin
+      .from("goals")
+      .select("id, progress")
+      .eq("user_id", userId);
+    const goals = (allGoals ?? []) as Array<{ id: string; progress: number }>;
+
+    const { data: completions } = await supabaseAdmin
+      .from("habit_completions")
+      .select("habit_id, completion_date, completed")
+      .eq("user_id", userId)
+      .gte("completion_date", sinceDate);
+    const completedRows = (completions ?? []) as Array<{ habit_id: string; completion_date: string; completed: boolean }>;
+    const completedTrue = completedRows.filter(r => r.completed === true);
+    const completedFalse = completedRows.filter(r => r.completed === false);
+
+    const goalIds = goals.map(g => g.id);
+    const milestonesResult = goalIds.length === 0
+      ? { data: [] as any[] }
+      : await supabaseAdmin
+          .from("goal_milestones")
+          .select("id, goal_id, completed_at")
+          .in("goal_id", goalIds);
+    const milestones = (milestonesResult.data ?? []) as Array<{ id: string; goal_id: string; completed_at: string | null }>;
+
+    const last7Cut = today.getTime() - 7 * 24 * 60 * 60 * 1000;
+    const last7Iso = new Date(last7Cut).toISOString().slice(0, 10);
+    const completedLast7 = completedTrue.filter(r => r.completion_date >= last7Iso).length;
+    const missedLast7 = completedFalse.filter(r => r.completion_date >= last7Iso).length;
+
+    const completionRate = clampPct(safeDiv(completedTrue.length, completedRows.length) * 100);
+    const expected = habits.length * w;
+    const consistency = clampPct(safeDiv(completedTrue.length, expected) * 100);
+
+    // Recovery: count gaps in completion dates that were followed by another streak
+    const dates = Array.from(new Set(completedTrue.map(r => r.completion_date))).sort();
+    const dateSet = new Set(dates);
+    let breaksTaken = 0;
+    let breaksRecovered = 0;
+    let inBreakFlag = false;
+    for (let i = dates.length - 1; i >= 0; i--) {
+      const d = dates[i]!;
+      const prev = new Date(new Date(d).getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      if (!dateSet.has(prev) && i < dates.length - 1) {
+        breaksTaken++;
+        if (inBreakFlag) breaksRecovered++;
+        else inBreakFlag = true;
+      } else if (dateSet.has(prev)) {
+        inBreakFlag = false;
+      }
+    }
+    const recovery = clampPct(safeDiv(breaksRecovered, breaksTaken) * 100);
+
+    let streak = 0;
+    for (let i = 0; ; i++) {
+      const d = new Date(today.getTime() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      if (dateSet.has(d)) streak++;
+      else break;
+      if (streak > 60) break;
+    }
+    const streak_hunter = clampPct(safeDiv(streak, 30) * 100);
+
+    const totalMilestones = milestones.length || 1;
+    const doneMilestones = milestones.filter(m => m.completed_at !== null).length;
+    const completionist = clampPct(safeDiv(doneMilestones, totalMilestones) * 100);
+
+    const prev7Start = last7Cut - 7 * 24 * 60 * 60 * 1000;
+    const last7Count = completedTrue.filter(r => Date.parse(r.completion_date) >= last7Cut).length;
+    const prev7Count = completedTrue.filter(r => {
+      const t = Date.parse(r.completion_date);
+      return t >= prev7Start && t < last7Cut;
+    }).length;
+    let momentum: number;
+    if (prev7Count === 0 && last7Count === 0) momentum = 50;
+    else if (prev7Count === 0) momentum = last7Count > 0 ? 80 : 50;
+    else momentum = clampPct(((last7Count - prev7Count) / prev7Count) * 50 + 50);
+
+    const diffBucket = { easy: 0, medium: 0, hard: 0 } as Record<Difficulty, number>;
+    for (const h of habits) {
+      const k = (h.difficulty as Difficulty) ?? "medium";
+      diffBucket[k] = (diffBucket[k] ?? 0) + 1;
+    }
+    const avgDifficulty: Difficulty =
+      diffBucket.easy >= diffBucket.medium && diffBucket.easy >= diffBucket.hard
+        ? "easy"
+        : diffBucket.hard >= diffBucket.medium
+          ? "hard"
+          : "medium";
+
+    const lastMonth = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const newHabitsLast30 = habits.filter(h => Date.parse(h.created_at) >= lastMonth.getTime()).length;
+
+    const traits: PersonaFeatures = {
+      consistency: Math.round(consistency),
+      recovery: Math.round(recovery),
+      completionist: Math.round(completionist),
+      streak_hunter: Math.round(streak_hunter),
+      momentum: Math.round(momentum),
+    };
+
+    const evidence: PersonaEvidence = {
+      streaksRecovered: breaksRecovered,
+      longestStreak: streak,
+      completedLast7,
+      missedLast7,
+      completionRate,
+      avgDifficulty,
+      goalCount: goals.length,
+      habitCount: habits.length,
+      newHabitsLast30,
+      windowDays: w,
+    };
+
+    const archetype = classifyArchetype(traits);
+    const advice = deriveAdvice(archetype, traits, evidence);
+    const headline = DEFAULT_HEADLINE[archetype];
+
+    const generatedAt = new Date().toISOString();
+
+    try {
+      await supabaseAdmin.from("persona_profiles").upsert({
+        user_id: userId,
+        archetype,
+        traits: traits as unknown as Record<string, unknown>,
+        evidence: evidence as unknown as Record<string, unknown>,
+        window_days: w,
+        computed_at: generatedAt,
+      }, { onConflict: "user_id" });
+    } catch (e) {
+      console.warn("[PersonaRepository] upsert best-effort failed:", (e as Error).message);
+    }
+
+    return {
+      archetype,
+      headline,
+      traits,
+      evidence,
+      advice,
+      generatedAt,
+      windowDays: w,
+    };
+  }
+
+  async getCached(userId: string, windowDays: number, freshnessMs: number) {
+    const { data, error } = await supabaseAdmin
+      .from("persona_profiles")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error || !data) return null;
+    const ageMs = Date.now() - new Date((data as any).computed_at).getTime();
+    if (ageMs > freshnessMs) return null;
+    if ((data as any).window_days !== windowDays) return null;
+    return data;
+  }
+
+  async getCoachContext(userId: string, windowDays = 14): Promise<string> {
+    const p = await this.compute(userId, windowDays);
+    const lines: string[] = [];
+    lines.push(`User Persona: ${p.archetype}`);
+    lines.push(`Top traits (0-100):`);
+    const entries = Object.entries(p.traits) as Array<[keyof PersonaFeatures, number]>;
+    entries.sort((a, b) => b[1] - a[1]);
+    const top = entries.slice(0, 3);
+    const descMap: Record<keyof PersonaFeatures, string> = {
+      consistency: "completes daily habits consistently",
+      recovery: "comes back strong after streaks break",
+      completionist: "finishes milestones steadily",
+      streak_hunter: "builds and defends multi-day streaks",
+      momentum: "completion rates are growing week-over-week",
+    };
+    for (const [k, v] of top) lines.push(`  ${k}: ${v} - ${descMap[k]}`);
+    lines.push(`Difficulty recommendation: ${p.advice.difficulty}`);
+    if (p.advice.habit.length > 0) {
+      lines.push(`Recent habit advice:`);
+      for (const h of p.advice.habit) lines.push(`  - ${h}`);
+    }
+    if (p.advice.suggestedMilestone) {
+      lines.push(`Suggested next milestone: "${p.advice.suggestedMilestone.title}"`);
+      lines.push(`  reason: ${p.advice.suggestedMilestone.reason}`);
+    }
+    return lines.join("\n");
+  }
+}
+
