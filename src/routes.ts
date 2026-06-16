@@ -8,6 +8,7 @@ import {
   goalSchema,
   GOAL_WIZARD_TAG,
   oauthSchema,
+  personaWindowDaysSchema,
   preferencesSchema,
   profileSchema,
   refreshSessionSchema,
@@ -15,13 +16,13 @@ import {
   updateGoalSchema,
   wizardGoalPayloadSchema,
 } from "./schemas.js";
-import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, UserService } from "./services.js";
+import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, PersonaService, UserService } from "./services.js";
 import { agentChat, agentSuggestMilestones } from "./llm-client.js";
 import { currentDriver } from "./llm-dispatcher.js";
 import { GoalRepository } from "./repositories.js";
 import { AppError } from "./errors.js";
 
-export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),coach=new CoachService(),milestones=new MilestoneService(); const id=z.string().uuid();
+export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(); const id=z.string().uuid();
 apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
 apiRouter.post("/auth/register",async(q,r)=>r.status(201).json({data:await auth.register(registerSchema.parse(q.body))}));
 apiRouter.post("/auth/login",async(q,r)=>r.json({data:await auth.login(authSchema.parse(q.body))}));
@@ -42,6 +43,8 @@ apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.g
 apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
 apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashboard.goalPerformance(q.userId!)}));
 apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
+apiRouter.get("/progress/persona",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse(q.query);return r.json({data:await persona.compute(q.userId!,w)});});
+apiRouter.post("/progress/persona/refresh",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse((q.body&&(q.body as any).windowDays)||q.query);return r.json({data:await persona.compute(q.userId!,w,true)});});
 apiRouter.get("/coach/sessions",requireUser,async(q,r)=>r.json({data:await coach.sessions(q.userId!)}));
 apiRouter.post("/coach/sessions",requireUser,async(q,r)=>r.status(201).json({data:await coach.createSession(q.userId!,z.object({title:z.string().min(1).max(120).optional()}).parse(q.body).title)}));
 apiRouter.patch("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);const body=coachSessionUpdateSchema.parse(q.body);const updated=await coach.renameSession(q.userId!,sid,body.title);return r.json({data:updated});});
@@ -149,11 +152,17 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
     content: m.content
   }));
 
+  const personaContext = await persona.getCoachContext(userId, 14).catch((e) => {
+    console.warn("[coach] persona context best-effort failed:", (e as Error).message);
+    return "";
+  });
+
   const systemPrompt = `You are a smart AI Coach for GoalPath.
 You help users plan goals and maintain habits.
-Current User Data (STRICT SOURCE OF TRUTH):
+${personaContext ? `<PersonaContext>\n${personaContext}\n</PersonaContext>\n` : ""}Current User Data (STRICT SOURCE OF TRUTH):
 ${JSON.stringify(context, null, 2)}
 Rules:
+- Adapt your tone to the user's persona archetype above — keep the tone matched to ${personaContext ? "their style. " : "their context."}Mention suggested next milestone in passing when appropriate; never override the user's stated choices.
 - DO NOT hallucinate dates or progress.
 - When user expresses INTENT to set up a new goal (eg. "bikin goal baru", "I want to track", "mau mulai fitness 3 bulan", "let's set a goal", "set up a goal", "saya mau belajar Spanish"), call the start_goal_wizard tool — even if some details are missing. Pass any details the user mentioned as parameters; leave others null. After this tool call, briefly tell the user you'll open the wizard.
 - Otherwise, when the goal is mostly planned and you have title + category, call the createGoal tool directly.
