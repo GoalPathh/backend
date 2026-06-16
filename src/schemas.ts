@@ -25,6 +25,7 @@ export const preferencesSchema = z.object({
   notifications: z.array(z.object({ id: z.string(), title: z.string(), enabled: z.boolean(), description: z.string() })).optional(),
 });
 export const completionSchema = z.object({ completed: z.boolean(), completionDate: z.string().date().optional() });
+export const coachSessionUpdateSchema = z.object({ title: z.string().min(1).max(120) });
 
 // ── Interactive Goal Wizard payload (sent when chat message is tagged [goal_finalized]) ──
 // All fields optional on the SCHEMA side so we can give the user a clear error

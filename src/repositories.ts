@@ -282,12 +282,54 @@ export class CoachRepository {
     if (!result.data) throw new AppError("Coach session not found.", 404);
   }
   async sessions(userId: string) {
-    const result = await supabaseAdmin.from("coach_sessions").select("id,title,created_at,updated_at").eq("user_id", userId).order("updated_at", { ascending: false });
-    assertDatabaseResult(result.error); return result.data ?? [];
+    const result = await supabaseAdmin
+      .from("coach_sessions")
+      .select("id,title,created_at,updated_at,user_id")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
+    assertDatabaseResult(result.error);
+    // Enrich with message_count via a cheap aggregate call. Single round-trip via head/count.
+    const rows = result.data ?? [];
+    if (rows.length === 0) return [] as Array<{
+      id: string; title: string; created_at: string; updated_at: string; message_count: number;
+    }>;
+    const ids = rows.map((r) => r.id);
+    const counts = await supabaseAdmin
+      .from("coach_messages")
+      .select("session_id", { count: "exact", head: false })
+      .eq("user_id", userId)
+      .in("session_id", ids);
+    assertDatabaseResult(counts.error);
+    const map = new Map<string, number>();
+    (counts.data ?? []).forEach((row: { session_id: string }) => {
+      map.set(row.session_id, (map.get(row.session_id) ?? 0) + 1);
+    });
+    return rows.map((r) => ({ ...r, message_count: map.get(r.id) ?? 0 }));
   }
   async createSession(userId: string, title = "New Session") {
     const result = await supabaseAdmin.from("coach_sessions").insert({ user_id: userId, title }).select("*").single();
     assertDatabaseResult(result.error); return result.data;
+  }
+  async renameSession(userId: string, sessionId: string, title: string) {
+    await this.assertSessionOwner(userId, sessionId);
+    const result = await supabaseAdmin
+      .from("coach_sessions")
+      .update({ title, updated_at: new Date().toISOString() })
+      .eq("id", sessionId)
+      .eq("user_id", userId)
+      .select("*")
+      .single();
+    assertDatabaseResult(result.error);
+    return result.data;
+  }
+  async deleteSession(userId: string, sessionId: string) {
+    await this.assertSessionOwner(userId, sessionId);
+    const result = await supabaseAdmin
+      .from("coach_sessions")
+      .delete()
+      .eq("id", sessionId)
+      .eq("user_id", userId);
+    assertDatabaseResult(result.error);
   }
   async messages(userId: string, sessionId: string) {
     await this.assertSessionOwner(userId, sessionId);

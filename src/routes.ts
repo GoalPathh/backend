@@ -4,6 +4,7 @@ import { requireUser } from "./middleware.js";
 import {
   authSchema,
   completionSchema,
+  coachSessionUpdateSchema,
   goalSchema,
   GOAL_WIZARD_TAG,
   oauthSchema,
@@ -43,6 +44,8 @@ apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashb
 apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
 apiRouter.get("/coach/sessions",requireUser,async(q,r)=>r.json({data:await coach.sessions(q.userId!)}));
 apiRouter.post("/coach/sessions",requireUser,async(q,r)=>r.status(201).json({data:await coach.createSession(q.userId!,z.object({title:z.string().min(1).max(120).optional()}).parse(q.body).title)}));
+apiRouter.patch("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);const body=coachSessionUpdateSchema.parse(q.body);const updated=await coach.renameSession(q.userId!,sid,body.title);return r.json({data:updated});});
+apiRouter.delete("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);await coach.deleteSession(q.userId!,sid);return r.status(204).send();});
 apiRouter.get("/coach/sessions/:id/messages",requireUser,async(q,r)=>r.json({data:await coach.messages(q.userId!,id.parse(q.params.id))}));
 
 // ── Coach message endpoint ──
