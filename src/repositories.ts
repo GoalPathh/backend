@@ -1,4 +1,6 @@
+import { createHash, randomUUID } from "node:crypto";
 import { AppError, assertDatabaseResult } from "./errors.js";
+import { config } from "./config.js";
 import { supabaseAdmin } from "./supabase.js";
 import type {
   PersonaArchetype,
@@ -21,6 +23,112 @@ function daysBetween(a: string, b: string): number {
 }
 
 const selectGoal = "id,title,category,period,progress,start_date,target_date,reminder_enabled,notification_preference,created_at,updated_at,habits(id,title,duration,difficulty,time_range,reminder_time,active_days,priority,created_at)";
+const scheduleDays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
+const timeRangeOrder = { morning: 0, afternoon: 1, evening: 2, anytime: 3 } as const;
+const progressRangeDays = {
+  "last-7-days": 7,
+  "last-30-days": 30,
+  "last-3-months": 90,
+  "last-6-months": 180,
+  "last-year": 365,
+  custom: 30,
+} as const;
+
+function resolveProgressRangeDays(range?: string) {
+  return progressRangeDays[range as keyof typeof progressRangeDays] ?? progressRangeDays["last-7-days"];
+}
+
+function buildDateWindow(days: number) {
+  return Array.from({ length: days }, (_, index) => {
+    const offset = days - 1 - index;
+    return new Date(Date.now() - offset * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  });
+}
+
+function formatProgressDateLabel(dateKey: string, days: number) {
+  const date = new Date(`${dateKey}T00:00:00`);
+  if (days <= 7) {
+    return date.toLocaleDateString("en-US", { weekday: "short" });
+  }
+  return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function isHabitScheduledOnDate(
+  habit: { active_days?: string[] | null; created_at?: string; time_range?: string | null },
+  dateKey: string,
+  goalStartDate?: string,
+) {
+  const activeDays = Array.isArray(habit.active_days) ? habit.active_days : [];
+  const dayKey = scheduleDays[new Date(`${dateKey}T00:00:00`).getDay()]!;
+  const createdDate = String(habit.created_at ?? "").slice(0, 10);
+  const startsAt = String(goalStartDate ?? "").slice(0, 10);
+
+  if (createdDate && createdDate > dateKey) return false;
+  if (startsAt && startsAt > dateKey) return false;
+
+  return activeDays.length === 0 || activeDays.includes(dayKey);
+}
+
+function getTodaySummaryMessage(completed: number, total: number, streak: number, nextHabitTitle?: string) {
+  if (total === 0) {
+    return "Keep today simple. Add one small habit to start building momentum.";
+  }
+
+  if (completed === total) {
+    return "Today's plan is complete. Keep the streak protected and let the pace stay realistic.";
+  }
+
+  if (completed === 0 && streak > 0) {
+    return `Keep the ${streak}-day streak alive. Start with ${nextHabitTitle ?? "one small habit"} and make the first rep easy.`;
+  }
+
+  if (completed === 0) {
+    return `Start with ${nextHabitTitle ?? "one small habit"} and build momentum before adding intensity.`;
+  }
+
+  const remaining = total - completed;
+  return `${completed} habit${completed === 1 ? "" : "s"} done. ${remaining} more to finish today's plan.`;
+}
+
+function getTodayMotivation(completed: number, total: number, streak: number, nextHabitTitle?: string) {
+  if (total === 0) {
+    return {
+      title: "Build today's plan",
+      body: "You do not have a scheduled habit for today yet. Add one lightweight habit so Today can track real progress.",
+      emphasis: "setup",
+    };
+  }
+
+  if (completed === total) {
+    return {
+      title: "Plan protected",
+      body: `All ${total} habits scheduled for today are done. Use the extra space to recover, reflect, or prepare tomorrow's first action.`,
+      emphasis: "complete",
+    };
+  }
+
+  if (completed === 0 && streak >= 7) {
+    return {
+      title: "Protect the streak",
+      body: `You already built a ${streak}-day streak. Do ${nextHabitTitle ?? "the easiest habit"} first and keep today's win small but certain.`,
+      emphasis: "streak",
+    };
+  }
+
+  if (completed === 0) {
+    return {
+      title: "Start light",
+      body: `Open with ${nextHabitTitle ?? "your easiest habit"} and aim for completion, not intensity. Momentum matters more than volume right now.`,
+      emphasis: "start",
+    };
+  }
+
+  return {
+    title: "Momentum is building",
+    body: `${completed} of ${total} habits are already done. Finish ${nextHabitTitle ?? "the next habit"} to keep today's plan realistic and complete.`,
+    emphasis: "momentum",
+  };
+}
 
 export class GoalRepository {
   async list(userId: string) {
@@ -62,13 +170,187 @@ export class GoalRepository {
     return this.find(userId, id);
   }
   async remove(userId: string, id: string) { await this.find(userId,id); const result = await supabaseAdmin.from("goals").delete().eq("user_id", userId).eq("id", id); assertDatabaseResult(result.error); }
+
+  async dashboard(userId: string) {
+    const goals = await this.list(userId);
+    const performance = await new DashboardRepository().getGoalPerformance(userId);
+    const performanceMap = new Map(performance.map((item: any) => [item.id, item]));
+    const goalIds = goals.map((goal: any) => goal.id);
+
+    const milestonesResult = goalIds.length === 0
+      ? { data: [] as any[], error: null }
+      : await supabaseAdmin
+          .from("goal_milestones")
+          .select("id, goal_id, completed_at")
+          .eq("user_id", userId)
+          .in("goal_id", goalIds);
+    assertDatabaseResult(milestonesResult.error);
+
+    const milestonesByGoal = new Map<string, { total: number; completed: number }>();
+    for (const milestone of milestonesResult.data ?? []) {
+      const current = milestonesByGoal.get((milestone as any).goal_id) ?? { total: 0, completed: 0 };
+      current.total += 1;
+      if ((milestone as any).completed_at) current.completed += 1;
+      milestonesByGoal.set((milestone as any).goal_id, current);
+    }
+
+    const enrichedGoals = goals.map((goal: any) => {
+      const totalMinutes = (goal.habits ?? []).reduce((sum: number, habit: any) => sum + Number(habit.duration ?? 0), 0);
+      const milestoneInfo = milestonesByGoal.get(goal.id) ?? { total: 0, completed: 0 };
+      const perf = performanceMap.get(goal.id);
+      return {
+        ...goal,
+        totalMinutes,
+        status: perf?.status ?? "On Track",
+        daysLeft: perf?.daysLeft ?? null,
+        milestoneCount: milestoneInfo.total,
+        completedMilestoneCount: milestoneInfo.completed,
+      };
+    });
+
+    const totalHabits = enrichedGoals.reduce((sum: number, goal: any) => sum + (goal.habits?.length ?? 0), 0);
+    const totalMinutes = enrichedGoals.reduce((sum: number, goal: any) => sum + goal.totalMinutes, 0);
+    const averageProgress = enrichedGoals.length
+      ? Math.round(enrichedGoals.reduce((sum: number, goal: any) => sum + Number(goal.progress ?? 0), 0) / enrichedGoals.length)
+      : 0;
+    const strongestGoal = enrichedGoals.reduce<any | null>(
+      (best, goal) => (!best || Number(goal.progress ?? 0) > Number(best.progress ?? 0) ? goal : best),
+      null,
+    );
+    const atRiskGoals = enrichedGoals.filter((goal: any) => goal.status === "At Risk" || goal.status === "Behind Schedule").length;
+    const completedMilestones = enrichedGoals.reduce((sum: number, goal: any) => sum + goal.completedMilestoneCount, 0);
+
+    return {
+      summary: {
+        activeGoals: enrichedGoals.length,
+        totalHabits,
+        totalMinutes,
+        averageProgress,
+        atRiskGoals,
+        completedMilestones,
+      },
+      strongestGoal,
+      goals: enrichedGoals,
+    };
+  }
 }
 
 export class UserRepository {
-  async profile(userId:string) { const result=await supabaseAdmin.from("profiles").select("*").eq("id",userId).single(); assertDatabaseResult(result.error); return result.data; }
+  async profile(userId:string) {
+    const result = await supabaseAdmin.from("profiles").select("*").eq("id", userId).maybeSingle();
+    assertDatabaseResult(result.error);
+
+    if (result.data) return result.data;
+
+    const fallback = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (fallback.error) throw new AppError("Profile not found.", 404);
+
+    const metadata = fallback.data.user?.user_metadata ?? {};
+    const email = fallback.data.user?.email ?? "";
+    const name = String(metadata.name ?? email.split("@")[0] ?? "GoalPath User").trim() || "GoalPath User";
+    const usernameBase = String(metadata.username ?? email.split("@")[0] ?? "goalpath").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "");
+    const username = usernameBase ? `@${usernameBase}` : "@goalpath";
+
+    const insertResult = await supabaseAdmin
+      .from("profiles")
+      .insert({
+        id: userId,
+        name,
+        username,
+        avatar_url: metadata.avatar_url ?? null,
+        xp: 0,
+        streak_days: 0,
+        level: 1,
+      })
+      .select("*")
+      .single();
+    assertDatabaseResult(insertResult.error);
+    return insertResult.data;
+  }
   async updateProfile(userId:string,input:any) { const result=await supabaseAdmin.from("profiles").update({...(input.name!==undefined&&{name:input.name}),...(input.username!==undefined&&{username:input.username}),...(input.avatarUrl!==undefined&&{avatar_url:input.avatarUrl}),updated_at:new Date().toISOString()}).eq("id",userId).select("*").single(); assertDatabaseResult(result.error); return result.data; }
-  async preferences(userId:string) { const result=await supabaseAdmin.from("user_preferences").select("*").eq("user_id",userId).single(); assertDatabaseResult(result.error); return result.data; }
+  async preferences(userId:string) {
+    const result = await supabaseAdmin.from("user_preferences").select("*").eq("user_id", userId).maybeSingle();
+    assertDatabaseResult(result.error);
+    if (result.data) return result.data;
+
+    return {
+      user_id: userId,
+      appearance: "light",
+      notifications: [
+        { id: "daily-habit", title: "Daily Habit Reminders", enabled: true, description: "Stay on track with daily check-ins." },
+        { id: "progress-updates", title: "Goal Progress Updates", enabled: true, description: "Get updates when goals move forward." },
+        { id: "achievement-alerts", title: "Achievement Notifications", enabled: true, description: "Celebrate every badge you unlock." },
+        { id: "ai-coach", title: "AI Coach Suggestions", enabled: false, description: "Receive smart prompts from your coach." },
+        { id: "weekly-reports", title: "Weekly Reports", enabled: true, description: "Review your performance every week." },
+      ],
+    };
+  }
   async updatePreferences(userId:string,input:any) { const result=await supabaseAdmin.from("user_preferences").upsert({user_id:userId,...(input.appearance!==undefined&&{appearance:input.appearance}),...(input.notifications!==undefined&&{notifications:input.notifications}),updated_at:new Date().toISOString()}).select("*").single(); assertDatabaseResult(result.error); return result.data; }
+  createAvatarUploadSignature(userId: string) {
+    if (!config.cloudinaryCloudName || !config.cloudinaryApiKey || !config.cloudinaryApiSecret) {
+      throw new AppError("Cloudinary upload is not configured on the server.", 503);
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder = `${config.cloudinaryUploadFolder.replace(/\/+$/, "")}/${userId}`;
+    const publicId = `avatar-${timestamp}-${randomUUID().slice(0, 8)}`;
+    const params = {
+      folder,
+      public_id: publicId,
+      timestamp,
+    };
+    const stringToSign = Object.entries(params)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${value}`)
+      .join("&");
+    const signature = createHash("sha1")
+      .update(`${stringToSign}${config.cloudinaryApiSecret}`)
+      .digest("hex");
+
+    return {
+      cloudName: config.cloudinaryCloudName,
+      apiKey: config.cloudinaryApiKey,
+      timestamp,
+      signature,
+      folder,
+      publicId,
+      uploadUrl: `https://api.cloudinary.com/v1_1/${config.cloudinaryCloudName}/image/upload`,
+    };
+  }
+  async overview(userId: string) {
+    const [profile, preferences, goalDashboard, progress] = await Promise.all([
+      this.profile(userId),
+      this.preferences(userId),
+      new GoalRepository().dashboard(userId),
+      new DashboardRepository().getProgressDash(userId),
+    ]);
+
+    const unreadNotificationsResult = await supabaseAdmin
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .is("read_at", null);
+    assertDatabaseResult(unreadNotificationsResult.error);
+
+    return {
+      profile,
+      preferences,
+      stats: {
+        activeGoals: goalDashboard.summary.activeGoals,
+        currentStreak: progress.currentStreak,
+        completionRate: progress.completionRate,
+        completedMilestones: goalDashboard.summary.completedMilestones,
+        totalXp: Number(profile?.xp ?? progress.totalXp ?? 0),
+      },
+      summary: {
+        totalHabits: goalDashboard.summary.totalHabits,
+        totalMinutes: goalDashboard.summary.totalMinutes,
+        averageProgress: goalDashboard.summary.averageProgress,
+        atRiskGoals: goalDashboard.summary.atRiskGoals,
+        unreadNotifications: unreadNotificationsResult.count ?? 0,
+      },
+    };
+  }
 }
 
 export class DashboardRepository {
@@ -185,6 +467,219 @@ export class DashboardRepository {
     };
   }
 
+  async getProgressOverview(userId: string, range: string) {
+    const windowDays = resolveProgressRangeDays(range);
+    const dateWindow = buildDateWindow(windowDays);
+    const startDate = dateWindow[0]!;
+    const endDate = dateWindow[dateWindow.length - 1]!;
+
+    const [stats, goals, goalPerformance, profileResult, completionsResult, milestonesResult] = await Promise.all([
+      this.getProgressDash(userId),
+      new GoalRepository().list(userId),
+      this.getGoalPerformance(userId),
+      supabaseAdmin.from("profiles").select("xp, streak_days, level").eq("id", userId).maybeSingle(),
+      supabaseAdmin
+        .from("habit_completions")
+        .select("habit_id, completion_date, completed")
+        .eq("user_id", userId)
+        .gte("completion_date", startDate)
+        .lte("completion_date", endDate),
+      supabaseAdmin
+        .from("goal_milestones")
+        .select("id, goal_id, completed_at")
+        .eq("user_id", userId),
+    ]);
+
+    assertDatabaseResult(profileResult.error);
+    assertDatabaseResult(completionsResult.error);
+    assertDatabaseResult(milestonesResult.error);
+
+    const completionMap = new Map<string, boolean>();
+    for (const row of completionsResult.data ?? []) {
+      completionMap.set(`${(row as any).habit_id}:${(row as any).completion_date}`, Boolean((row as any).completed));
+    }
+
+    const habits = goals.flatMap((goal: any) =>
+      (goal.habits ?? []).map((habit: any) => ({
+        ...habit,
+        goal_id: goal.id,
+        goal_title: goal.title,
+        goal_start_date: goal.start_date,
+      })),
+    );
+
+    const dayStats = dateWindow.map((dateKey) => {
+      const scheduledHabits = habits.filter((habit: any) =>
+        isHabitScheduledOnDate(habit, dateKey, habit.goal_start_date),
+      );
+      const completedHabits = scheduledHabits.filter(
+        (habit: any) => completionMap.get(`${habit.id}:${dateKey}`) === true,
+      );
+      const rate = scheduledHabits.length ? clampPct((completedHabits.length / scheduledHabits.length) * 100) : 0;
+
+      return {
+        date: dateKey,
+        label: formatProgressDateLabel(dateKey, windowDays),
+        scheduled: scheduledHabits.length,
+        completed: completedHabits.length,
+        completionRate: rate,
+      };
+    });
+
+    const habitPerformance = habits
+      .map((habit: any) => {
+        const scheduledDates = dateWindow.filter((dateKey) =>
+          isHabitScheduledOnDate(habit, dateKey, habit.goal_start_date),
+        );
+        const completedCount = scheduledDates.filter(
+          (dateKey) => completionMap.get(`${habit.id}:${dateKey}`) === true,
+        ).length;
+        const expectedCount = scheduledDates.length;
+        const midpoint = Math.floor(scheduledDates.length / 2);
+        const firstHalf = scheduledDates.slice(0, midpoint);
+        const secondHalf = scheduledDates.slice(midpoint);
+        const firstHalfRate = firstHalf.length
+          ? firstHalf.filter((dateKey) => completionMap.get(`${habit.id}:${dateKey}`) === true).length / firstHalf.length
+          : 0;
+        const secondHalfRate = secondHalf.length
+          ? secondHalf.filter((dateKey) => completionMap.get(`${habit.id}:${dateKey}`) === true).length / secondHalf.length
+          : 0;
+
+        return {
+          id: habit.id,
+          title: habit.title,
+          completionRate: expectedCount ? clampPct((completedCount / expectedCount) * 100) : 0,
+          trend: secondHalfRate > firstHalfRate ? "up" : secondHalfRate < firstHalfRate ? "down" : "flat",
+          totalCompletions: completedCount,
+          timeRange: habit.time_range ?? "anytime",
+        };
+      })
+      .filter((habit) => habit.totalCompletions > 0 || habit.completionRate > 0)
+      .sort((a, b) => b.completionRate - a.completionRate || b.totalCompletions - a.totalCompletions)
+      .slice(0, 5);
+
+    const heatmap = dayStats.slice(-35).map((day) => ({
+      date: day.date,
+      level:
+        day.scheduled === 0
+          ? "none"
+          : day.completionRate >= 80
+            ? "high"
+            : day.completionRate >= 50
+              ? "medium"
+              : day.completed > 0
+                ? "low"
+                : "none",
+    }));
+
+    const completedGoals = goalPerformance.filter((goal: any) => goal.status === "Completed").length;
+    const atRiskGoals = goalPerformance.filter((goal: any) => goal.status === "At Risk" || goal.status === "Behind Schedule").length;
+    const completedMilestones = (milestonesResult.data ?? []).filter((row: any) => row.completed_at).length;
+    const totalMilestones = (milestonesResult.data ?? []).length;
+    const totalScheduled = dayStats.reduce((sum, day) => sum + day.scheduled, 0);
+    const totalCompletedInRange = dayStats.reduce((sum, day) => sum + day.completed, 0);
+    const completionRate = totalScheduled ? clampPct((totalCompletedInRange / totalScheduled) * 100) : 0;
+
+    const achievements = [
+      {
+        id: "first-habit",
+        title: "First Habit Completed",
+        subtitle: stats.totalCompletions > 0 ? "At least one habit has been completed." : "Complete one habit to unlock this badge.",
+        emoji: "🏆",
+        unlocked: stats.totalCompletions > 0,
+      },
+      {
+        id: "streak-7",
+        title: "7 Day Streak",
+        subtitle: stats.currentStreak >= 7 ? `Current streak is ${stats.currentStreak} days.` : "Reach a 7-day streak to unlock this badge.",
+        emoji: "🔥",
+        unlocked: stats.currentStreak >= 7,
+      },
+      {
+        id: "consistency-30",
+        title: "30 Day Consistency",
+        subtitle: stats.currentStreak >= 30 ? "A 30-day streak has already been reached." : "Keep the streak alive until it reaches 30 days.",
+        emoji: "⭐",
+        unlocked: stats.currentStreak >= 30,
+      },
+      {
+        id: "goal-achiever",
+        title: "Goal Achiever",
+        subtitle: completedGoals > 0 ? `${completedGoals} goal${completedGoals > 1 ? "s are" : " is"} already complete.` : "Finish one goal to unlock this badge.",
+        emoji: "🎯",
+        unlocked: completedGoals > 0,
+      },
+    ];
+
+    const timeRangeStats = habits.reduce<Record<string, { expected: number; completed: number }>>((acc, habit: any) => {
+      const scheduledDates = dateWindow.filter((dateKey) =>
+        isHabitScheduledOnDate(habit, dateKey, habit.goal_start_date),
+      );
+      const completedCount = scheduledDates.filter(
+        (dateKey) => completionMap.get(`${habit.id}:${dateKey}`) === true,
+      ).length;
+      const key = habit.time_range ?? "anytime";
+      const current = acc[key] ?? { expected: 0, completed: 0 };
+      current.expected += scheduledDates.length;
+      current.completed += completedCount;
+      acc[key] = current;
+      return acc;
+    }, {});
+
+    const bestTimeRange = Object.entries(timeRangeStats)
+      .map(([slot, values]) => ({
+        slot,
+        rate: values.expected ? clampPct((values.completed / values.expected) * 100) : 0,
+      }))
+      .sort((a, b) => b.rate - a.rate)[0];
+
+    const strongestHabit = habitPerformance[0];
+    const insights = [
+      {
+        id: "consistency-summary",
+        message: totalScheduled > 0 ? `${totalCompletedInRange} of ${totalScheduled} scheduled habits were completed in this range.` : "There is no scheduled habit activity in the selected range yet.",
+        accent: "blue",
+      },
+      {
+        id: "best-time-range",
+        message: bestTimeRange && bestTimeRange.rate > 0 ? `${bestTimeRange.slot.charAt(0).toUpperCase() + bestTimeRange.slot.slice(1)} is currently your strongest time slot at ${bestTimeRange.rate}%.` : "No time-of-day pattern is strong enough yet. Keep logging completions to reveal one.",
+        accent: "gold",
+      },
+      {
+        id: "risk-or-strength",
+        message: atRiskGoals > 0 ? `${atRiskGoals} goal${atRiskGoals > 1 ? "s are" : " is"} behind pace. Reduce scope or finish the easiest habit first.` : strongestHabit ? `"${strongestHabit.title}" is your most reliable habit right now at ${strongestHabit.completionRate}%.` : "Complete a few habits and this space will start surfacing actionable patterns.",
+        accent: atRiskGoals > 0 ? "coral" : "lavender",
+      },
+    ];
+
+    return {
+      range,
+      windowDays,
+      summary: {
+        activeGoals: goals.length,
+        currentStreak: stats.currentStreak,
+        totalXp: Number(profileResult.data?.xp ?? stats.totalXp ?? 0),
+        completionRate,
+        habitsCompleted: totalCompletedInRange,
+        habitsMissed: Math.max(totalScheduled - totalCompletedInRange, 0),
+        completedGoals,
+        atRiskGoals,
+        totalMilestones,
+        completedMilestones,
+      },
+      goals: goalPerformance,
+      consistencySeries: dayStats.map((day) => ({
+        date: day.label,
+        completionRate: day.completionRate,
+        habitsCompleted: day.completed,
+      })),
+      habitPerformance,
+      heatmap,
+      achievements,
+      insights,
+    };
+  }
+
   /** Per-goal real performance numbers — built off goals.progress (now auto-recomputed). */
   async getGoalPerformance(userId: string) {
     const { data: goals } = await supabaseAdmin
@@ -197,7 +692,7 @@ export class DashboardRepository {
     return (goals as any[]).map((g, idx) => {
       const target = new Date(g.target_date).getTime();
       const daysLeft = Math.floor((target - today) / (1000 * 60 * 60 * 24));
-      const pace = g.progress >= 100 ? "On Track"
+      const pace = g.progress >= 100 ? "Completed"
                   : daysLeft < 7 ? "At Risk"
                   : g.progress >= 50 ? "On Track"
                   : "Behind Schedule";
@@ -222,7 +717,7 @@ export class DashboardRepository {
       user_id: userId,
       completion_date: completionDate ?? new Date().toISOString().slice(0, 10),
       completed,
-      completed_at: new Date().toISOString(),
+      completed_at: completed ? new Date().toISOString() : null,
     }, { onConflict: "habit_id,completion_date" }).select("*").single();
     assertDatabaseResult(result.error);
 
@@ -242,9 +737,103 @@ export class DashboardRepository {
   async today(userId: string) {
     const goals = await new GoalRepository().list(userId);
     const today = new Date().toISOString().slice(0, 10);
-    const completions = await supabaseAdmin.from("habit_completions").select("habit_id,completed").eq("user_id", userId).eq("completion_date", today);
+    const dayKey = scheduleDays[new Date(`${today}T00:00:00`).getDay()]!;
+
+    const completions = await supabaseAdmin
+      .from("habit_completions")
+      .select("habit_id,completed")
+      .eq("user_id", userId)
+      .eq("completion_date", today);
     assertDatabaseResult(completions.error);
-    return { date: today, goals, completions: completions.data ?? [] };
+
+    const profileResult = await supabaseAdmin
+      .from("profiles")
+      .select("name, username, avatar_url, xp, streak_days, level")
+      .eq("id", userId)
+      .maybeSingle();
+    assertDatabaseResult(profileResult.error);
+
+    const stats = await this.getProgressDash(userId);
+    const completionMap = new Map<string, boolean>(
+      (completions.data ?? []).map((row: any) => [row.habit_id, row.completed]),
+    );
+
+    const habits = goals
+      .flatMap((goal: any) =>
+        (goal.habits ?? [])
+          .filter((habit: any) => {
+            const activeDays = Array.isArray(habit.active_days) ? habit.active_days : [];
+            return activeDays.length === 0 || activeDays.includes(dayKey);
+          })
+          .map((habit: any) => ({
+            id: habit.id,
+            title: habit.title,
+            duration: habit.duration,
+            difficulty: habit.difficulty,
+            schedule: {
+              timeRange: habit.time_range,
+              reminderTime: habit.reminder_time ?? undefined,
+              activeDays: Array.isArray(habit.active_days) ? habit.active_days : [],
+              priority: habit.priority,
+            },
+            createdAt: habit.created_at,
+            goalId: goal.id,
+            goalTitle: goal.title,
+            completed: completionMap.get(habit.id) ?? false,
+          })),
+      )
+      .sort((a: any, b: any) => {
+        const timeOrder = timeRangeOrder[a.schedule.timeRange as keyof typeof timeRangeOrder] - timeRangeOrder[b.schedule.timeRange as keyof typeof timeRangeOrder];
+        if (timeOrder !== 0) return timeOrder;
+        return a.title.localeCompare(b.title);
+      });
+
+    const goalsWithToday = goals.map((goal: any) => {
+      const todayHabits = habits.filter((habit: any) => habit.goalId === goal.id);
+      const todayCompletedHabits = todayHabits.filter((habit: any) => habit.completed).length;
+      return {
+        ...goal,
+        todayTotalHabits: todayHabits.length,
+        todayCompletedHabits,
+      };
+    });
+
+    const completedHabits = habits.filter((habit: any) => habit.completed).length;
+    const totalHabits = habits.length;
+    const completionRate = totalHabits > 0 ? Math.round((completedHabits / totalHabits) * 100) : 0;
+    const currentStreak = Number(stats.currentStreak ?? profileResult.data?.streak_days ?? 0);
+    const totalXp = Number(stats.totalXp ?? profileResult.data?.xp ?? 0);
+    const level = Number(profileResult.data?.level ?? stats.profile?.level ?? 1);
+    const focusQueue = habits.filter((habit: any) => !habit.completed).slice(0, 3);
+    const nextHabitTitle = focusQueue[0]?.title;
+
+    return {
+      date: today,
+      profile: {
+        name: profileResult.data?.name ?? null,
+        username: profileResult.data?.username ?? null,
+        avatar_url: profileResult.data?.avatar_url ?? null,
+        xp: totalXp,
+        streak_days: currentStreak,
+        level,
+      },
+      summary: {
+        activeGoals: goals.length,
+        totalHabits,
+        completedHabits,
+        completionRate,
+        currentStreak,
+        totalXp,
+        level,
+        habitsCompleted7d: stats.habitsCompleted7d ?? 0,
+        habitsMissed7d: stats.habitsMissed7d ?? 0,
+        message: getTodaySummaryMessage(completedHabits, totalHabits, currentStreak, nextHabitTitle),
+      },
+      goals: goalsWithToday,
+      habits,
+      focusQueue,
+      motivation: getTodayMotivation(completedHabits, totalHabits, currentStreak, nextHabitTitle),
+    };
   }
 
   async getUserContextSnapshot(userId: string) {

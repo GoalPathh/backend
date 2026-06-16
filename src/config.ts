@@ -28,6 +28,22 @@ const env = z.object({
   LLM_PROVIDER_URL: z.string().url().default("https://generativelanguage.googleapis.com/v1beta/openai"),
   LLM_API_KEY: z.string().default("mock-key"),
   LLM_MODEL: z.string().default("gemini-3.1-flash-lite"),
+  CLOUDINARY_CLOUD_NAME: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().optional(),
+  ),
+  CLOUDINARY_API_KEY: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().optional(),
+  ),
+  CLOUDINARY_API_SECRET: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().optional(),
+  ),
+  CLOUDINARY_UPLOAD_FOLDER: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().optional(),
+  ),
   // "raw"   = custom fetch + SSE parser (best for LMStudio / Ollama / TokenRouter / Gemini proxy
   //           where Vercel SDK's streaming parser has historically mis-handled partial chunks)
   // "vercel" = ai SDK + @ai-sdk/openai (best for hosted OpenAI / together.ai / groq / vLLM
@@ -45,5 +61,9 @@ export const config = {
   llmProviderUrl: env.LLM_PROVIDER_URL,
   llmApiKey: env.LLM_API_KEY,
   llmModel: env.LLM_MODEL,
+  cloudinaryCloudName: env.CLOUDINARY_CLOUD_NAME,
+  cloudinaryApiKey: env.CLOUDINARY_API_KEY,
+  cloudinaryApiSecret: env.CLOUDINARY_API_SECRET,
+  cloudinaryUploadFolder: env.CLOUDINARY_UPLOAD_FOLDER || "goalpath/avatars",
   llmDriver: env.LLM_DRIVER,
 };

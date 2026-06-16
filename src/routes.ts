@@ -10,6 +10,7 @@ import {
   GOAL_WIZARD_TAG,
   oauthSchema,
   personaWindowDaysSchema,
+  progressRangeSchema,
   preferencesSchema,
   profileSchema,
   refreshSessionSchema,
@@ -33,17 +34,21 @@ apiRouter.post("/auth/google",async(q,r)=>r.json({data:await auth.googleOAuth(oa
 apiRouter.post("/auth/forgot-password",async(q,r)=>r.json({data:await auth.forgotPassword(forgotPasswordSchema.parse(q.body).email)}));
 apiRouter.post("/auth/password",requireUser,async(q,r)=>r.json({data:await auth.updatePassword(q.userId!,updatePasswordSchema.parse(q.body).password)}));
 apiRouter.get("/goals",requireUser,async(q,r)=>r.json({data:await goals.list(q.userId!)}));
+apiRouter.get("/goals/dashboard",requireUser,async(q,r)=>r.json({data:await goals.dashboard(q.userId!)}));
 apiRouter.get("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.get(q.userId!,id.parse(q.params.id))}));
 apiRouter.post("/goals",requireUser,async(q,r)=>r.status(201).json({data:await goals.create(q.userId!,goalSchema.parse(q.body))}));
 apiRouter.patch("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.update(q.userId!,id.parse(q.params.id),updateGoalSchema.parse(q.body))}));
 apiRouter.delete("/goals/:id",requireUser,async(q,r)=>{await goals.remove(q.userId!,id.parse(q.params.id));r.status(204).send()});
+apiRouter.get("/me/overview",requireUser,async(q,r)=>r.json({data:await users.overview(q.userId!)}));
 apiRouter.get("/me",requireUser,async(q,r)=>r.json({data:await users.profile(q.userId!)}));
 apiRouter.patch("/me",requireUser,async(q,r)=>r.json({data:await users.updateProfile(q.userId!,profileSchema.parse(q.body))}));
+apiRouter.post("/me/avatar/signature",requireUser,async(q,r)=>r.json({data:await users.avatarUploadSignature(q.userId!)}));
 apiRouter.get("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.preferences(q.userId!)}));
 apiRouter.patch("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.updatePreferences(q.userId!,preferencesSchema.parse(q.body))}));
 apiRouter.get("/today",requireUser,async(q,r)=>r.json({data:await dashboard.today(q.userId!)}));
 apiRouter.put("/habits/:id/completion",requireUser,async(q,r)=>{const input=completionSchema.parse(q.body);r.json({data:await dashboard.setCompletion(q.userId!,id.parse(q.params.id),input.completed,input.completionDate)})});
 apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.getUserContextSnapshot(q.userId!)}));
+apiRouter.get("/progress/overview",requireUser,async(q,r)=>{const {range}=progressRangeSchema.parse(q.query);r.json({data:await dashboard.progressOverview(q.userId!,range)});});
 apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
 apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashboard.goalPerformance(q.userId!)}));
 apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
