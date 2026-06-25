@@ -5,46 +5,57 @@ import {
   authSchema,
   completionSchema,
   coachSessionUpdateSchema,
+  forgotPasswordSchema,
   goalSchema,
   GOAL_WIZARD_TAG,
   oauthSchema,
   personaWindowDaysSchema,
+  progressRangeSchema,
   preferencesSchema,
   profileSchema,
   refreshSessionSchema,
   registerSchema,
+  updatePasswordSchema,
   updateGoalSchema,
   wizardGoalPayloadSchema,
 } from "./schemas.js";
-import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, PersonaService, UserService } from "./services.js";
+import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, NotificationService, PersonaService, UserService } from "./services.js";
 import { agentChat, agentSuggestMilestones } from "./llm-client.js";
 import { currentDriver } from "./llm-dispatcher.js";
 import { GoalRepository } from "./repositories.js";
 import { AppError } from "./errors.js";
 
-export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(); const id=z.string().uuid();
+export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(); const id=z.string().uuid();
 apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
 apiRouter.post("/auth/register",async(q,r)=>r.status(201).json({data:await auth.register(registerSchema.parse(q.body))}));
 apiRouter.post("/auth/login",async(q,r)=>r.json({data:await auth.login(authSchema.parse(q.body))}));
 apiRouter.post("/auth/refresh",async(q,r)=>r.json({data:await auth.refresh(refreshSessionSchema.parse(q.body).refreshToken)}));
 apiRouter.post("/auth/google",async(q,r)=>r.json({data:await auth.googleOAuth(oauthSchema.parse(q.body).next)}));
+apiRouter.post("/auth/forgot-password",async(q,r)=>r.json({data:await auth.forgotPassword(forgotPasswordSchema.parse(q.body).email)}));
+apiRouter.post("/auth/password",requireUser,async(q,r)=>r.json({data:await auth.updatePassword(q.userId!,updatePasswordSchema.parse(q.body).password)}));
 apiRouter.get("/goals",requireUser,async(q,r)=>r.json({data:await goals.list(q.userId!)}));
+apiRouter.get("/goals/dashboard",requireUser,async(q,r)=>r.json({data:await goals.dashboard(q.userId!)}));
 apiRouter.get("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.get(q.userId!,id.parse(q.params.id))}));
 apiRouter.post("/goals",requireUser,async(q,r)=>r.status(201).json({data:await goals.create(q.userId!,goalSchema.parse(q.body))}));
 apiRouter.patch("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.update(q.userId!,id.parse(q.params.id),updateGoalSchema.parse(q.body))}));
 apiRouter.delete("/goals/:id",requireUser,async(q,r)=>{await goals.remove(q.userId!,id.parse(q.params.id));r.status(204).send()});
+apiRouter.get("/me/overview",requireUser,async(q,r)=>r.json({data:await users.overview(q.userId!)}));
 apiRouter.get("/me",requireUser,async(q,r)=>r.json({data:await users.profile(q.userId!)}));
 apiRouter.patch("/me",requireUser,async(q,r)=>r.json({data:await users.updateProfile(q.userId!,profileSchema.parse(q.body))}));
+apiRouter.post("/me/avatar/signature",requireUser,async(q,r)=>r.json({data:await users.avatarUploadSignature(q.userId!)}));
 apiRouter.get("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.preferences(q.userId!)}));
 apiRouter.patch("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.updatePreferences(q.userId!,preferencesSchema.parse(q.body))}));
 apiRouter.get("/today",requireUser,async(q,r)=>r.json({data:await dashboard.today(q.userId!)}));
 apiRouter.put("/habits/:id/completion",requireUser,async(q,r)=>{const input=completionSchema.parse(q.body);r.json({data:await dashboard.setCompletion(q.userId!,id.parse(q.params.id),input.completed,input.completionDate)})});
 apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.getUserContextSnapshot(q.userId!)}));
+apiRouter.get("/progress/overview",requireUser,async(q,r)=>{const {range}=progressRangeSchema.parse(q.query);r.json({data:await dashboard.progressOverview(q.userId!,range)});});
 apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
 apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashboard.goalPerformance(q.userId!)}));
 apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
 apiRouter.get("/progress/persona",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse(q.query);return r.json({data:await persona.compute(q.userId!,w)});});
 apiRouter.post("/progress/persona/refresh",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse((q.body&&(q.body as any).windowDays)||q.query);return r.json({data:await persona.compute(q.userId!,w,true)});});
+apiRouter.get("/notifications",requireUser,async(q,r)=>r.json({data:await notifications.list(q.userId!)}));
+apiRouter.patch("/notifications/read-all",requireUser,async(q,r)=>r.json({data:await notifications.markAllRead(q.userId!)}));
 apiRouter.get("/coach/sessions",requireUser,async(q,r)=>r.json({data:await coach.sessions(q.userId!)}));
 apiRouter.post("/coach/sessions",requireUser,async(q,r)=>r.status(201).json({data:await coach.createSession(q.userId!,z.object({title:z.string().min(1).max(120).optional()}).parse(q.body).title)}));
 apiRouter.patch("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);const body=coachSessionUpdateSchema.parse(q.body);const updated=await coach.renameSession(q.userId!,sid,body.title);return r.json({data:updated});});

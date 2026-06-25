@@ -3,6 +3,8 @@ import { z } from "zod";
 export const authSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
 export const registerSchema = authSchema.extend({ name: z.string().min(2).max(80) });
 export const refreshSessionSchema = z.object({ refreshToken: z.string().min(1) });
+export const forgotPasswordSchema = z.object({ email: z.string().email() });
+export const updatePasswordSchema = z.object({ password: z.string().min(8) });
 export const oauthSchema = z.object({
   next: z.string().regex(/^\/(?!\/)/, "Next path must be an internal path.").default("/today"),
 });
@@ -26,6 +28,12 @@ export const preferencesSchema = z.object({
 });
 export const completionSchema = z.object({ completed: z.boolean(), completionDate: z.string().date().optional() });
 export const coachSessionUpdateSchema = z.object({ title: z.string().min(1).max(120) });
+export const progressRangeSchema = z.object({
+  range: z
+    .enum(["last-7-days", "last-30-days", "last-3-months", "last-6-months", "last-year", "custom"])
+    .optional()
+    .default("last-7-days"),
+});
 
 // ── Interactive Goal Wizard payload (sent when chat message is tagged [goal_finalized]) ──
 // All fields optional on the SCHEMA side so we can give the user a clear error

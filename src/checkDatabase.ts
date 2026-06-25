@@ -1,6 +1,6 @@
 import { supabaseAdmin } from "./supabase.js";
 
-const tables = ["profiles", "user_preferences", "goals", "habits", "habit_completions", "coach_sessions", "coach_messages"];
+const tables = ["profiles", "user_preferences", "goals", "habits", "habit_completions", "coach_sessions", "coach_messages", "notifications"];
 let failed = false;
 
 for (const table of tables) {
