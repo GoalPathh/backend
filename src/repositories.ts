@@ -25,6 +25,7 @@ function daysBetween(a: string, b: string): number {
 const selectGoal = "id,title,category,period,progress,start_date,target_date,reminder_enabled,notification_preference,created_at,updated_at,habits(id,title,duration,difficulty,time_range,reminder_time,active_days,priority,created_at)";
 const scheduleDays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
 const timeRangeOrder = { morning: 0, afternoon: 1, evening: 2, anytime: 3 } as const;
+const XP_PER_HABIT_COMPLETION = 30;
 const progressRangeDays = {
   "last-7-days": 7,
   "last-30-days": 30,
@@ -340,7 +341,7 @@ export class UserRepository {
         currentStreak: progress.currentStreak,
         completionRate: progress.completionRate,
         completedMilestones: goalDashboard.summary.completedMilestones,
-        totalXp: Number(profile?.xp ?? progress.totalXp ?? 0),
+        totalXp: Number(progress.totalXp ?? profile?.xp ?? 0),
       },
       summary: {
         totalHabits: goalDashboard.summary.totalHabits,
@@ -658,7 +659,7 @@ export class DashboardRepository {
       summary: {
         activeGoals: goals.length,
         currentStreak: stats.currentStreak,
-        totalXp: Number(profileResult.data?.xp ?? stats.totalXp ?? 0),
+        totalXp: Number(stats.totalXp ?? profileResult.data?.xp ?? 0),
         completionRate,
         habitsCompleted: totalCompletedInRange,
         habitsMissed: Math.max(totalScheduled - totalCompletedInRange, 0),
@@ -712,14 +713,61 @@ export class DashboardRepository {
     const habit = await supabaseAdmin.from("habits").select("id, goal_id").eq("id", habitId).eq("user_id", userId).maybeSingle();
     assertDatabaseResult(habit.error);
     if (!habit.data) throw new AppError("Habit not found.", 404);
-    const result = await supabaseAdmin.from("habit_completions").upsert({
-      habit_id: habitId,
-      user_id: userId,
-      completion_date: completionDate ?? new Date().toISOString().slice(0, 10),
-      completed,
-      completed_at: completed ? new Date().toISOString() : null,
-    }, { onConflict: "habit_id,completion_date" }).select("*").single();
-    assertDatabaseResult(result.error);
+    const targetDate = completionDate ?? new Date().toISOString().slice(0, 10);
+    const existing = await supabaseAdmin
+      .from("habit_completions")
+      .select("id, completed")
+      .eq("habit_id", habitId)
+      .eq("user_id", userId)
+      .eq("completion_date", targetDate)
+      .maybeSingle();
+    assertDatabaseResult(existing.error);
+
+    const wasCompleted = Boolean(existing.data?.completed);
+    const xpDelta = completed === wasCompleted ? 0 : completed ? XP_PER_HABIT_COMPLETION : -XP_PER_HABIT_COMPLETION;
+    let completionResult: Record<string, unknown>;
+
+    if (completed) {
+      const result = await supabaseAdmin.from("habit_completions").upsert({
+        habit_id: habitId,
+        user_id: userId,
+        completion_date: targetDate,
+        completed: true,
+        completed_at: new Date().toISOString(),
+      }, { onConflict: "habit_id,completion_date" }).select("*").single();
+      assertDatabaseResult(result.error);
+      completionResult = result.data;
+    } else {
+      const result = await supabaseAdmin
+        .from("habit_completions")
+        .delete()
+        .eq("habit_id", habitId)
+        .eq("user_id", userId)
+        .eq("completion_date", targetDate);
+      assertDatabaseResult(result.error);
+      completionResult = { habit_id: habitId, completion_date: targetDate, completed: false };
+    }
+
+    if (xpDelta !== 0) {
+      const totalCompletedResult = await supabaseAdmin
+        .from("habit_completions")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("completed", true);
+      assertDatabaseResult(totalCompletedResult.error);
+
+      const nextXp = Math.max(0, Number(totalCompletedResult.count ?? 0) * XP_PER_HABIT_COMPLETION);
+      const updateProfileResult = await supabaseAdmin
+        .from("profiles")
+        .update({ xp: nextXp, updated_at: new Date().toISOString() })
+        .eq("id", userId);
+      assertDatabaseResult(updateProfileResult.error);
+
+      completionResult.xp_delta = xpDelta;
+      completionResult.total_xp = nextXp;
+    } else {
+      completionResult.xp_delta = 0;
+    }
 
     // Auto-recompute parent goal.progress (also fires SQL trigger on deployed env)
     if (habit.data.goal_id) {
@@ -731,7 +779,7 @@ export class DashboardRepository {
       }
     }
 
-    return result.data;
+    return completionResult;
   }
 
   async today(userId: string) {
