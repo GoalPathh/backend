@@ -24,13 +24,32 @@ import { agentChat, agentSuggestMilestones } from "./llm-client.js";
 import { currentDriver } from "./llm-dispatcher.js";
 import { GoalRepository } from "./repositories.js";
 import { AppError } from "./errors.js";
+import { generateEmbedding } from "./services/embeddings.js";
+
+const setAuthCookies = (res: any, data: any) => {
+  if (data?.session) {
+    res.cookie("goalpath_access_token", data.session.access_token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: data.session.expires_in * 1000,
+    });
+    res.cookie("goalpath_refresh_token", data.session.refresh_token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+    });
+  }
+};
 
 export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(); const id=z.string().uuid();
 apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
-apiRouter.post("/auth/register",async(q,r)=>r.status(201).json({data:await auth.register(registerSchema.parse(q.body))}));
-apiRouter.post("/auth/login",async(q,r)=>r.json({data:await auth.login(authSchema.parse(q.body))}));
-apiRouter.post("/auth/refresh",async(q,r)=>r.json({data:await auth.refresh(refreshSessionSchema.parse(q.body).refreshToken)}));
+apiRouter.post("/auth/register",async(q,r)=>{const data=await auth.register(registerSchema.parse(q.body));setAuthCookies(r,data);r.status(201).json({data})});
+apiRouter.post("/auth/login",async(q,r)=>{const data=await auth.login(authSchema.parse(q.body));setAuthCookies(r,data);r.json({data})});
+apiRouter.post("/auth/refresh",async(q,r)=>{const token=q.cookies?.goalpath_refresh_token||refreshSessionSchema.parse(q.body).refreshToken;const data=await auth.refresh(token);setAuthCookies(r,data);r.json({data})});
 apiRouter.post("/auth/google",async(q,r)=>r.json({data:await auth.googleOAuth(oauthSchema.parse(q.body).next)}));
+apiRouter.post("/auth/logout",async(q,r)=>{r.clearCookie("goalpath_access_token");r.clearCookie("goalpath_refresh_token");r.json({data:{success:true}})});
 apiRouter.post("/auth/forgot-password",async(q,r)=>r.json({data:await auth.forgotPassword(forgotPasswordSchema.parse(q.body).email)}));
 apiRouter.post("/auth/password",requireUser,async(q,r)=>r.json({data:await auth.updatePassword(q.userId!,updatePasswordSchema.parse(q.body).password)}));
 apiRouter.get("/goals",requireUser,async(q,r)=>r.json({data:await goals.list(q.userId!)}));
@@ -45,7 +64,7 @@ apiRouter.patch("/me",requireUser,async(q,r)=>r.json({data:await users.updatePro
 apiRouter.post("/me/avatar/signature",requireUser,async(q,r)=>r.json({data:await users.avatarUploadSignature(q.userId!)}));
 apiRouter.get("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.preferences(q.userId!)}));
 apiRouter.patch("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.updatePreferences(q.userId!,preferencesSchema.parse(q.body))}));
-apiRouter.get("/today",requireUser,async(q,r)=>r.json({data:await dashboard.today(q.userId!)}));
+apiRouter.get("/today",requireUser,async(q,r)=>{const tzOffset=q.query.tzOffset?parseInt(q.query.tzOffset as string,10):undefined;r.json({data:await dashboard.today(q.userId!,tzOffset)})});
 apiRouter.put("/habits/:id/completion",requireUser,async(q,r)=>{const input=completionSchema.parse(q.body);r.json({data:await dashboard.setCompletion(q.userId!,id.parse(q.params.id),input.completed,input.completionDate)})});
 apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.getUserContextSnapshot(q.userId!)}));
 apiRouter.get("/progress/overview",requireUser,async(q,r)=>{const {range}=progressRangeSchema.parse(q.query);r.json({data:await dashboard.progressOverview(q.userId!,range)});});
@@ -60,7 +79,9 @@ apiRouter.get("/coach/sessions",requireUser,async(q,r)=>r.json({data:await coach
 apiRouter.post("/coach/sessions",requireUser,async(q,r)=>r.status(201).json({data:await coach.createSession(q.userId!,z.object({title:z.string().min(1).max(120).optional()}).parse(q.body).title)}));
 apiRouter.patch("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);const body=coachSessionUpdateSchema.parse(q.body);const updated=await coach.renameSession(q.userId!,sid,body.title);return r.json({data:updated});});
 apiRouter.delete("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);await coach.deleteSession(q.userId!,sid);return r.status(204).send();});
+apiRouter.get("/coach/sessions/:id",requireUser,async(q,r)=>r.json({data:await coach.session(q.userId!,id.parse(q.params.id))}));
 apiRouter.get("/coach/sessions/:id/messages",requireUser,async(q,r)=>r.json({data:await coach.messages(q.userId!,id.parse(q.params.id))}));
+apiRouter.get("/coach/quota",requireUser,async(q,r)=>r.json({data:await coach.getQuota(q.userId!)}));
 
 // ── Coach message endpoint ──
 apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
@@ -70,6 +91,17 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
     role: z.enum(["user","assistant"]).default("user"),
     content: z.string().min(1).max(20000)
   }).parse(q.body);
+
+  // --- RATE LIMIT GUARD: Max 50 messages per 3 hours ---
+  const quota = await coach.getQuota(userId);
+  if (quota.remaining_messages <= 0 && quota.reset_at) {
+    const now = new Date().getTime();
+    const resetTime = new Date(quota.reset_at).getTime();
+    if (now < resetTime) {
+      throw new AppError("Limit percakapan tercapai (Maks 50 pesan per 3 jam). Silakan coba lagi nanti.", 429);
+    }
+  }
+  // -----------------------------------------------------
 
   // 0. Detect interactive Goal Wizard submit (skip LLM, persist directly)
   if (input.content.startsWith(GOAL_WIZARD_TAG)) {
@@ -150,18 +182,30 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
     }
   }
 
-  // 1. Persist user message
-  await coach.addMessage(userId, sessionId, input.role, input.content);
+  // 1. Generate embedding & persist user message
+  const userEmbedding = await generateEmbedding(input.content);
+  await coach.addMessage(userId, sessionId, input.role, input.content, userEmbedding);
 
   // 2. Fetch history & RAG context
+  const RECENT_CHAT_CONTEXT_LIMIT = 10;
+  const SEMANTIC_MATCH_LIMIT = 5;
+
   const history = await coach.messages(userId, sessionId);
+  const semanticMatches = await coach.searchContext(userId, sessionId, userEmbedding, SEMANTIC_MATCH_LIMIT);
   const context = await dashboard.getUserContextSnapshot(userId);
 
-  // 3. Build messages for LLM (last 10 exchanges)
-  const messages = history.slice(-11).map(m => ({
+  // 3. Build messages for LLM
+  // We keep the last RECENT_CHAT_CONTEXT_LIMIT exchanges, plus the latest user message
+  const messages = history.slice(-(RECENT_CHAT_CONTEXT_LIMIT + 1)).map(m => ({
     role: m.role === "assistant" ? "assistant" : "user",
     content: m.content
   }));
+  
+  // Format deterministic RAG block to avoid mixing semantic memory directly into the current message text
+  let semanticBlock = "";
+  if (semanticMatches.length > 0) {
+    semanticBlock = "Relevant past messages:\n" + semanticMatches.map((m: any) => `[Historical ${m.role}]: ${m.content}`).join("\n") + "\n\n";
+  }
 
   const personaContext = await persona.getCoachContext(userId, 14).catch((e) => {
     console.warn("[coach] persona context best-effort failed:", (e as Error).message);
@@ -170,8 +214,10 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
 
   const systemPrompt = `You are a smart AI Coach for GoalPath.
 You help users plan goals and maintain habits.
-${personaContext ? `<PersonaContext>\n${personaContext}\n</PersonaContext>\n` : ""}Current User Data (STRICT SOURCE OF TRUTH):
+
+${personaContext ? `<PersonaContext>\n${personaContext}\n</PersonaContext>\n` : ""}${semanticBlock}Current User Data (STRICT SOURCE OF TRUTH):
 ${JSON.stringify(context, null, 2)}
+
 Rules:
 - Adapt your tone to the user's persona archetype above — keep the tone matched to ${personaContext ? "their style. " : "their context."}Mention suggested next milestone in passing when appropriate; never override the user's stated choices.
 - DO NOT hallucinate dates or progress.
@@ -183,6 +229,9 @@ Rules:
 - Always respond in the same language the user writes in.`;
 
   try {
+    // 4. Consume quota before calling the expensive LLM API
+    await coach.consumeQuota(userId);
+
     const aiText = await agentChat(systemPrompt, messages, userId);
     const assistantMsg = await coach.addMessage(userId, sessionId, "assistant", aiText);
     return r.status(201).json({ data: assistantMsg });
