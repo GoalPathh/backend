@@ -52,8 +52,8 @@ apiRouter.get("/progress/overview",requireUser,async(q,r)=>{const {range}=progre
 apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
 apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashboard.goalPerformance(q.userId!)}));
 apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
-apiRouter.get("/progress/persona",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse(q.query);return r.json({data:await persona.compute(q.userId!,w)});});
-apiRouter.post("/progress/persona/refresh",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse((q.body&&(q.body as any).windowDays)||q.query);return r.json({data:await persona.compute(q.userId!,w,true)});});
+apiRouter.get("/progress/persona",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse(q.query.windowDays);return r.json({data:await persona.compute(q.userId!,w)});});
+apiRouter.post("/progress/persona/refresh",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse((q.body&&(q.body as any).windowDays)||q.query.windowDays);return r.json({data:await persona.compute(q.userId!,w,true)});});
 apiRouter.get("/notifications",requireUser,async(q,r)=>r.json({data:await notifications.list(q.userId!)}));
 apiRouter.patch("/notifications/read-all",requireUser,async(q,r)=>r.json({data:await notifications.markAllRead(q.userId!)}));
 apiRouter.get("/coach/sessions",requireUser,async(q,r)=>r.json({data:await coach.sessions(q.userId!)}));
