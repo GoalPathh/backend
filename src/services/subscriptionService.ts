@@ -58,7 +58,7 @@ export class SubscriptionService {
     return {
       tier,
       status,
-      currentPeriodEnd: row?.current_period_end ?? null,
+      currentPeriodEnd: typeof row?.current_period_end === "string" ? row.current_period_end : null,
       limits: matrix.limits,
       features: matrix.features,
       premiumPriceIdr: config.premiumPriceIdr,
@@ -436,7 +436,8 @@ export class SubscriptionService {
     const { count } = await supabaseAdmin
       .from("goals")
       .select("id", { count: "exact", head: true })
-      .eq("user_id", userId);
+      .eq("user_id", userId)
+      .lt("progress", 100);
     if ((count ?? 0) >= FREE_LIMITS.goals) {
       throw new AppError(
         `Batas tier Free tercapai. Maksimal ${FREE_LIMITS.goals} goal aktif. Upgrade ke Premium untuk akses unlimited.`,
