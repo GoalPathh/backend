@@ -876,6 +876,47 @@ export class DashboardRepository {
   }
 }
 
+/**
+ * SubscriptionRepository — thin Supabase wrapper for subscription rows + payment audit log.
+ * Business logic (tier resolution, webhooks, limits) lives in ./services/subscriptionService.ts.
+ */
+export class SubscriptionRepository {
+  async findByUser(userId: string) {
+    const result = await supabaseAdmin.from("subscriptions").select("*").eq("user_id", userId).maybeSingle();
+    if (result.error) throw new AppError(`Failed to fetch subscription: ${result.error.message}`, 500);
+    return result.data ?? null;
+  }
+
+  async upsertTier(userId: string, payload: Record<string, unknown>) {
+    const result = await supabaseAdmin.from("subscriptions").upsert(
+      { user_id: userId, updated_at: new Date().toISOString(), ...payload },
+      { onConflict: "user_id" },
+    );
+    if (result.error) throw new AppError(`Failed to upsert subscription: ${result.error.message}`, 500);
+    return payload;
+  }
+
+  async recordPayment(orderId: string, payload: Record<string, unknown>) {
+    const result = await supabaseAdmin.from("payment_transactions").upsert(
+      { order_id: orderId, updated_at: new Date().toISOString(), ...payload },
+      { onConflict: "order_id" },
+    );
+    if (result.error) throw new AppError(`Failed to record payment: ${result.error.message}`, 500);
+    return payload;
+  }
+
+  async listPaymentsForUser(userId: string, limit = 10) {
+    const result = await supabaseAdmin
+      .from("payment_transactions")
+      .select("order_id, gross_amount, status, payment_type, transaction_id, created_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (result.error) throw new AppError(`Failed to list payments: ${result.error.message}`, 500);
+    return result.data ?? [];
+  }
+}
+
 type NotificationInput = {
   type: "habit_reminder" | "missed_habit" | "streak" | "coach_tip" | "progress_update" | "goal_risk";
   title: string;

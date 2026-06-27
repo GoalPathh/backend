@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { requireUser } from "./middleware.js";
+import { requirePremium, requireUser } from "./middleware.js";
 import {
   authSchema,
   completionSchema,
@@ -19,13 +19,13 @@ import {
   updateGoalSchema,
   wizardGoalPayloadSchema,
 } from "./schemas.js";
-import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, NotificationService, PersonaService, UserService } from "./services.js";
+import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, NotificationService, PersonaService, SubscriptionFacade, UserService } from "./services.js";
 import { agentChat, agentSuggestMilestones } from "./llm-client.js";
 import { currentDriver } from "./llm-dispatcher.js";
-import { GoalRepository } from "./repositories.js";
+import { GoalRepository, UserRepository } from "./repositories.js";
 import { AppError } from "./errors.js";
 
-export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(); const id=z.string().uuid();
+export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(),subscriptions=new SubscriptionFacade(); const id=z.string().uuid();
 apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
 apiRouter.post("/auth/register",async(q,r)=>r.status(201).json({data:await auth.register(registerSchema.parse(q.body))}));
 apiRouter.post("/auth/login",async(q,r)=>r.json({data:await auth.login(authSchema.parse(q.body))}));
@@ -36,7 +36,10 @@ apiRouter.post("/auth/password",requireUser,async(q,r)=>r.json({data:await auth.
 apiRouter.get("/goals",requireUser,async(q,r)=>r.json({data:await goals.list(q.userId!)}));
 apiRouter.get("/goals/dashboard",requireUser,async(q,r)=>r.json({data:await goals.dashboard(q.userId!)}));
 apiRouter.get("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.get(q.userId!,id.parse(q.params.id))}));
-apiRouter.post("/goals",requireUser,async(q,r)=>r.status(201).json({data:await goals.create(q.userId!,goalSchema.parse(q.body))}));
+apiRouter.post("/goals",requireUser,async(q,r)=>{
+  await subscriptions.assertCanCreateGoal(q.userId!);
+  return r.status(201).json({data:await goals.create(q.userId!,goalSchema.parse(q.body))});
+});
 apiRouter.patch("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.update(q.userId!,id.parse(q.params.id),updateGoalSchema.parse(q.body))}));
 apiRouter.delete("/goals/:id",requireUser,async(q,r)=>{await goals.remove(q.userId!,id.parse(q.params.id));r.status(204).send()});
 apiRouter.get("/me/overview",requireUser,async(q,r)=>r.json({data:await users.overview(q.userId!)}));
@@ -47,6 +50,52 @@ apiRouter.get("/me/preferences",requireUser,async(q,r)=>r.json({data:await users
 apiRouter.patch("/me/preferences",requireUser,async(q,r)=>r.json({data:await users.updatePreferences(q.userId!,preferencesSchema.parse(q.body))}));
 apiRouter.get("/today",requireUser,async(q,r)=>r.json({data:await dashboard.today(q.userId!)}));
 apiRouter.put("/habits/:id/completion",requireUser,async(q,r)=>{const input=completionSchema.parse(q.body);r.json({data:await dashboard.setCompletion(q.userId!,id.parse(q.params.id),input.completed,input.completionDate)})});
+
+// Premium-only: AI adaptive habit preview endpoint (deterministic stub).
+// Returns the suggested adaptive habit variations based on persona + completion history.
+const adaptiveHabitBody = z.object({
+  goalId: z.string().uuid(),
+  habitId: z.string().uuid().optional(),
+});
+apiRouter.post("/habits/adaptive/preview", requirePremium, async (q, r) => {
+  const input = adaptiveHabitBody.parse(q.body);
+  // Stub data — real implementation can plug the persona + completions into the LLM.
+  return r.json({
+    data: {
+      suggestions: [
+        { title: "Shrink to 2 minutes when energy is low", rationale: "Consistency drops after 7pm — keep the bar low." },
+        { title: "Pair with an existing morning ritual", rationale: "Best completion slot is 'morning' for this user." },
+        { title: "Switch to easier difficulty this week", rationale: "Current streak below 3 days — recover momentum first." },
+      ],
+      sourceGoalId: input.goalId,
+      sourceHabitId: input.habitId ?? null,
+    },
+  });
+});
+
+// Premium-only: Future Self Simulation — generates a 30-day projection narrative.
+apiRouter.get("/progress/future-self", requirePremium, async (q, r) => {
+  const days = z.coerce.number().int().min(7).max(180).default(30).parse(q.query.days ?? 30);
+  // Stub narrative block.
+  const today = new Date();
+  const future = new Date(today.getTime() + days * 24 * 60 * 60 * 1000);
+  return r.json({
+    data: {
+      horizonDays: days,
+      projectedAt: future.toISOString(),
+      narrative:
+        `If you maintain your habit completion rate over the next ${days} days, your streak ` +
+        "will compound, your milestone progress will accelerate, and your AI persona will shift " +
+        "toward a 'Marathon Runner' archetype. We'll send precision nudges right before your " +
+        "weekly drop-off window.",
+      keySignals: [
+        "Consistency score projected to grow by ~12 points",
+        "Risk: weekend slip — we'll schedule a Saturday keystone habit",
+        "Suggested unlock: streak-hunter achievement at day 14",
+      ],
+    },
+  });
+});
 apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.getUserContextSnapshot(q.userId!)}));
 apiRouter.get("/progress/overview",requireUser,async(q,r)=>{const {range}=progressRangeSchema.parse(q.query);r.json({data:await dashboard.progressOverview(q.userId!,range)});});
 apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
@@ -71,8 +120,12 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
     content: z.string().min(1).max(20000)
   }).parse(q.body);
 
+  // Free-tier daily guardrail: check BEFORE any DB write / LLM call.
+  await subscriptions.assertCanSendCoachMessage(userId);
+
   // 0. Detect interactive Goal Wizard submit (skip LLM, persist directly)
   if (input.content.startsWith(GOAL_WIZARD_TAG)) {
+    await subscriptions.assertCanCreateGoal(userId); // wizard finalizes a goal
     try {
       const jsonPart = input.content.slice(GOAL_WIZARD_TAG.length).trim();
       let parsed: unknown;
@@ -241,4 +294,36 @@ apiRouter.get("/goals/:id/milestones", requireUser, async (q, r) => {
   await new GoalRepository().find(userId, goalId); // owner check
   const rows = await milestones.listOf(userId, goalId);
   return r.json({ data: rows });
+});
+
+// ── Subscription routes ──
+// Mount webhook FIRST and with NO `requireUser` so Midtrans's unauthenticated
+// POST is accepted and signature verification is the only gate.
+apiRouter.post("/subscription/webhook", async (q, r) => {
+  const result = await subscriptions.handleWebhook(q.body);
+  return r.status(200).json({ data: result });
+});
+
+apiRouter.get("/subscription", requireUser, async (q, r) => {
+  return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
+});
+
+apiRouter.post("/subscription/checkout", requireUser, async (q, r) => {
+  const profile = await new UserRepository().profile(q.userId!);
+  const fallbackName = typeof (profile as any)?.name === "string" ? (profile as any).name : "GoalPath";
+  const checkout = await subscriptions.createCheckout(q.userId!, {
+    name: fallbackName,
+    email: (profile as any)?.email ?? null,
+  });
+  return r.status(201).json({ data: checkout });
+});
+
+apiRouter.post("/subscription/refresh", requireUser, async (q, r) => {
+  // Re-read subscription tier from DB (e.g. after returning from Midtrans finish URL).
+  return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
+});
+
+apiRouter.post("/subscription/cancel", requireUser, async (q, r) => {
+  await subscriptions.cancel(q.userId!);
+  return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
 });

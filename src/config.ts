@@ -49,6 +49,11 @@ const env = z.object({
   // "vercel" = ai SDK + @ai-sdk/openai (best for hosted OpenAI / together.ai / groq / vLLM
   //           that emit strict OpenAI-compatible JSON or SSE)
   LLM_DRIVER: z.enum(["raw", "vercel"]).default("raw"),
+  MIDTRANS_SERVER_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
+  MIDTRANS_CLIENT_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
+  MIDTRANS_IS_PRODUCTION: z.preprocess((value) => value === "true" || value === true, z.boolean().default(false)),
+  PREMIUM_PRICE_IDR: z.coerce.number().int().min(1).default(150000),
+  PREMIUM_PERIOD_DAYS: z.coerce.number().int().min(1).default(30),
 }).parse(rawEnv);
 
 export const config = {
@@ -66,4 +71,9 @@ export const config = {
   cloudinaryApiSecret: env.CLOUDINARY_API_SECRET,
   cloudinaryUploadFolder: env.CLOUDINARY_UPLOAD_FOLDER || "goalpath/avatars",
   llmDriver: env.LLM_DRIVER,
+  midtransServerKey: env.MIDTRANS_SERVER_KEY,
+  midtransClientKey: env.MIDTRANS_CLIENT_KEY,
+  midtransIsProduction: env.MIDTRANS_IS_PRODUCTION,
+  premiumPriceIdr: env.PREMIUM_PRICE_IDR,
+  premiumPeriodDays: env.PREMIUM_PERIOD_DAYS,
 };

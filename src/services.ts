@@ -1,8 +1,9 @@
 import { supabaseAdmin, supabaseAuth } from "./supabase.js";
 import { config } from "./config.js";
 import { AppError } from "./errors.js";
-import { CoachRepository, DashboardRepository, GoalRepository, MilestoneRepository, NotificationRepository, PersonaRepository, UserRepository } from "./repositories.js";
+import { CoachRepository, DashboardRepository, GoalRepository, MilestoneRepository, NotificationRepository, PersonaRepository, SubscriptionRepository, UserRepository } from "./repositories.js";
 import { deriveAdvice } from "./services/personaClassifier.js";
+import { SubscriptionService } from "./services/subscriptionService.js";
 
 export class AuthService {
   async register(input:{email:string;password:string;name:string}) { const {data,error}=await supabaseAuth.auth.signUp({email:input.email,password:input.password,options:{data:{name:input.name}}}); if(error) throw new AppError(error.message,400); return data; }
@@ -64,3 +65,34 @@ export class PersonaService {
   }
 }
 export class MilestoneService { constructor(private repo=new MilestoneRepository()){} listOf(u:string,goalId:string){return this.repo.list(u,goalId)} bulkReplace(u:string,goalId:string,items:Array<{title:string;target_date?:string;sort_order?:number}>){return this.repo.bulkInsert(u,goalId,items)} setDone(u:string,id:string,done:boolean){return this.repo.setDone(u,id,done)} remove(u:string,id:string){return this.repo.remove(u,id)} }
+
+/**
+ * SubscriptionService wrapper — proxies the raw service so future TTL/caching
+ * and event-emission hooks can be added here without touching call sites.
+ */
+export class SubscriptionFacade {
+  constructor(
+    private service: SubscriptionService = new SubscriptionService(),
+  ) {}
+
+  getMySubscription(userId: string) { return this.service.getMySubscription(userId); }
+  isPremiumActive(userId: string) { return this.service.isPremiumActive(userId); }
+  createCheckout(userId: string, profile: { name?: string | null; email?: string | null }) {
+    return this.service.createCheckout(userId, profile);
+  }
+  handleWebhook(notification: unknown) {
+    return this.service.handleWebhook(notification as Parameters<SubscriptionService["handleWebhook"]>[0]);
+  }
+  cancel(userId: string) { return this.service.cancel(userId); }
+
+  assertCanCreateGoal(userId: string) { return this.service.assertCanCreateGoal(userId); }
+  assertCanCreateHabit(userId: string, goalId: string) { return this.service.assertCanCreateHabit(userId, goalId); }
+  assertCanSendCoachMessage(userId: string) { return this.service.assertCanSendCoachMessage(userId); }
+  assertPremium(userId: string) { return this.service.assertPremium(userId); }
+}
+
+/**
+ * SubscriptionRepository re-exported for backward compat with future migrations
+ * (e.g. plan-history lookup). Implementation lives in ./repositories.
+ */
+export { SubscriptionRepository };
