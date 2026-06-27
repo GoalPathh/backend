@@ -288,8 +288,13 @@ Rules:
 - Always respond in the same language the user writes in.`;
 
   try {
-    // 4. Consume quota before calling the expensive LLM API
-    await coach.consumeQuota(userId);
+    // Note: a previous `await coach.consumeQuota(userId)` call lived here
+    // for the 3-hour rolling-window bookkeeping. After unifying the quota
+    // source-of-truth to the `coach_messages` table (read by both
+    // `assertCanSendCoachMessage` at the start of this route and
+    // `CoachRepository.getQuota` for the UI badge), incrementing a counter
+    // before LLM is redundant — the row written by `coach.addMessage` IS
+    // the next quota increment. So the consume call is intentionally gone.
 
     const aiText = await agentChat(systemPrompt, messages, userId);
     const assistantMsg = await coach.addMessage(userId, sessionId, "assistant", aiText);
