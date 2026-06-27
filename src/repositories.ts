@@ -25,6 +25,7 @@ function daysBetween(a: string, b: string): number {
 const selectGoal = "id,title,category,period,progress,start_date,target_date,reminder_enabled,notification_preference,created_at,updated_at,habits(id,title,duration,difficulty,time_range,reminder_time,active_days,priority,created_at)";
 const scheduleDays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
 const timeRangeOrder = { morning: 0, afternoon: 1, evening: 2, anytime: 3 } as const;
+const XP_PER_HABIT_COMPLETION = 30;
 const progressRangeDays = {
   "last-7-days": 7,
   "last-30-days": 30,
@@ -340,7 +341,7 @@ export class UserRepository {
         currentStreak: progress.currentStreak,
         completionRate: progress.completionRate,
         completedMilestones: goalDashboard.summary.completedMilestones,
-        totalXp: Number(profile?.xp ?? progress.totalXp ?? 0),
+        totalXp: Number(progress.totalXp ?? profile?.xp ?? 0),
       },
       summary: {
         totalHabits: goalDashboard.summary.totalHabits,
@@ -408,41 +409,85 @@ export class DashboardRepository {
    *  Replaces hardcoded mock expectations on the frontend.
    */
   async getProgressDash(userId: string) {
-    // habits total completed last 7 days
+    const todayStr = new Date().toISOString().slice(0, 10);
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    const { count: completedLast7 } = await supabaseAdmin
-      .from("habit_completions")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .eq("completed", true)
-      .gte("completion_date", sevenDaysAgo);
-    const { count: missedLast7 } = await supabaseAdmin
-      .from("habit_completions")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .eq("completed", false)
-      .gte("completion_date", sevenDaysAgo);
-    const { count: totalCompletions } = await supabaseAdmin
-      .from("habit_completions")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .eq("completed", true);
-    const { data: goals } = await supabaseAdmin
-      .from("goals")
-      .select("id, progress")
-      .eq("user_id", userId);
-    const activeGoals = goals?.length ?? 0;
-    // Naive streak: distinct dates with completed=true going back from today
-    const { data: streakRows } = await supabaseAdmin
-      .from("habit_completions")
-      .select("completion_date")
-      .eq("user_id", userId)
-      .eq("completed", true)
-      .order("completion_date", { ascending: false })
-      .limit(60);
+    
+    // Attempt to use the new RPC for O(1) query performance
+    const { data: rpcData, error: rpcError } = await supabaseAdmin.rpc("get_dashboard_progress", {
+      target_user_id: userId,
+      seven_days_ago: sevenDaysAgo,
+      today: todayStr
+    });
+
+    // Fallback to individual queries if RPC is not yet created
+    if (rpcError || !rpcData) {
+      const { count: completedLast7 } = await supabaseAdmin
+        .from("habit_completions")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("completed", true)
+        .gte("completion_date", sevenDaysAgo);
+      const { count: missedLast7 } = await supabaseAdmin
+        .from("habit_completions")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("completed", false)
+        .gte("completion_date", sevenDaysAgo);
+      const { count: totalCompletions } = await supabaseAdmin
+        .from("habit_completions")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("completed", true);
+      const { data: goals } = await supabaseAdmin
+        .from("goals")
+        .select("id, progress")
+        .eq("user_id", userId);
+      const activeGoals = goals?.length ?? 0;
+      // Naive streak: distinct dates with completed=true going back from today
+      const { data: streakRows } = await supabaseAdmin
+        .from("habit_completions")
+        .select("completion_date")
+        .eq("user_id", userId)
+        .eq("completed", true)
+        .order("completion_date", { ascending: false })
+        .limit(60);
+      let streak = 0;
+      if (streakRows && streakRows.length > 0) {
+        const dates = new Set<string>((streakRows as any[]).map(r => r.completion_date));
+        for (let i = 0; ; i++) {
+          const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+          if (dates.has(d)) streak++;
+          else break;
+          if (streak > 60) break;
+        }
+      }
+      const totalXp = (totalCompletions ?? 0) * 30; // simple XP model: 30 XP per completion
+      const completionRate = ((completedLast7 ?? 0) + (missedLast7 ?? 0)) > 0
+        ? Math.round(((completedLast7 ?? 0) / ((completedLast7 ?? 0) + (missedLast7 ?? 0))) * 100)
+        : 0;
+      const profile = await supabaseAdmin.from("profiles").select("xp, streak_days, level").eq("id", userId).maybeSingle();
+      return {
+        activeGoals,
+        habitsCompleted7d: completedLast7 ?? 0,
+        habitsMissed7d: missedLast7 ?? 0,
+        totalCompletions: totalCompletions ?? 0,
+        currentStreak: streak,
+        totalXp,
+        completionRate,
+        profile: profile?.data ?? { xp: totalXp, streak_days: streak, level: 1 },
+      };
+    }
+
+    // Process RPC data
+    const completedLast7 = Number(rpcData.completedLast7 || 0);
+    const missedLast7 = Number(rpcData.missedLast7 || 0);
+    const totalCompletions = Number(rpcData.totalCompletions || 0);
+    const activeGoals = Number(rpcData.activeGoals || 0);
+    const streakDates = (rpcData.streakRows || []) as string[];
+    
     let streak = 0;
-    if (streakRows && streakRows.length > 0) {
-      const dates = new Set<string>((streakRows as any[]).map(r => r.completion_date));
+    if (streakDates.length > 0) {
+      const dates = new Set<string>(streakDates);
       for (let i = 0; ; i++) {
         const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         if (dates.has(d)) streak++;
@@ -450,20 +495,21 @@ export class DashboardRepository {
         if (streak > 60) break;
       }
     }
-    const totalXp = (totalCompletions ?? 0) * 30; // simple XP model: 30 XP per completion
-    const completionRate = ((completedLast7 ?? 0) + (missedLast7 ?? 0)) > 0
-      ? Math.round(((completedLast7 ?? 0) / ((completedLast7 ?? 0) + (missedLast7 ?? 0))) * 100)
+    
+    const totalXp = totalCompletions * 30;
+    const completionRate = (completedLast7 + missedLast7) > 0
+      ? Math.round((completedLast7 / (completedLast7 + missedLast7)) * 100)
       : 0;
-    const profile = await supabaseAdmin.from("profiles").select("xp, streak_days, level").eq("id", userId).maybeSingle();
+      
     return {
       activeGoals,
-      habitsCompleted7d: completedLast7 ?? 0,
-      habitsMissed7d: missedLast7 ?? 0,
-      totalCompletions: totalCompletions ?? 0,
+      habitsCompleted7d: completedLast7,
+      habitsMissed7d: missedLast7,
+      totalCompletions,
       currentStreak: streak,
       totalXp,
       completionRate,
-      profile: profile?.data ?? { xp: totalXp, streak_days: streak, level: 1 },
+      profile: rpcData.profile ?? { xp: totalXp, streak_days: streak, level: 1 },
     };
   }
 
@@ -658,7 +704,7 @@ export class DashboardRepository {
       summary: {
         activeGoals: goals.length,
         currentStreak: stats.currentStreak,
-        totalXp: Number(profileResult.data?.xp ?? stats.totalXp ?? 0),
+        totalXp: Number(stats.totalXp ?? profileResult.data?.xp ?? 0),
         completionRate,
         habitsCompleted: totalCompletedInRange,
         habitsMissed: Math.max(totalScheduled - totalCompletedInRange, 0),
@@ -712,14 +758,62 @@ export class DashboardRepository {
     const habit = await supabaseAdmin.from("habits").select("id, goal_id").eq("id", habitId).eq("user_id", userId).maybeSingle();
     assertDatabaseResult(habit.error);
     if (!habit.data) throw new AppError("Habit not found.", 404);
-    const result = await supabaseAdmin.from("habit_completions").upsert({
-      habit_id: habitId,
-      user_id: userId,
-      completion_date: completionDate ?? new Date().toISOString().slice(0, 10),
-      completed,
-      completed_at: completed ? new Date().toISOString() : null,
-    }, { onConflict: "habit_id,completion_date" }).select("*").single();
-    assertDatabaseResult(result.error);
+
+    const targetDate = completionDate ?? new Date().toISOString().slice(0, 10);
+    const existing = await supabaseAdmin
+      .from("habit_completions")
+      .select("id, completed")
+      .eq("habit_id", habitId)
+      .eq("user_id", userId)
+      .eq("completion_date", targetDate)
+      .maybeSingle();
+    assertDatabaseResult(existing.error);
+
+    const wasCompleted = Boolean(existing.data?.completed);
+    const xpDelta = completed === wasCompleted ? 0 : completed ? XP_PER_HABIT_COMPLETION : -XP_PER_HABIT_COMPLETION;
+    let completionResult: Record<string, unknown>;
+
+    if (completed) {
+      const result = await supabaseAdmin.from("habit_completions").upsert({
+        habit_id: habitId,
+        user_id: userId,
+        completion_date: targetDate,
+        completed: true,
+        completed_at: new Date().toISOString(),
+      }, { onConflict: "habit_id,completion_date" }).select("*").single();
+      assertDatabaseResult(result.error);
+      completionResult = result.data;
+    } else {
+      const result = await supabaseAdmin
+        .from("habit_completions")
+        .delete()
+        .eq("habit_id", habitId)
+        .eq("user_id", userId)
+        .eq("completion_date", targetDate);
+      assertDatabaseResult(result.error);
+      completionResult = { habit_id: habitId, completion_date: targetDate, completed: false };
+    }
+
+    if (xpDelta !== 0) {
+      const totalCompletedResult = await supabaseAdmin
+        .from("habit_completions")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("completed", true);
+      assertDatabaseResult(totalCompletedResult.error);
+
+      const nextXp = Math.max(0, Number(totalCompletedResult.count ?? 0) * XP_PER_HABIT_COMPLETION);
+      const updateProfileResult = await supabaseAdmin
+        .from("profiles")
+        .update({ xp: nextXp, updated_at: new Date().toISOString() })
+        .eq("id", userId);
+      assertDatabaseResult(updateProfileResult.error);
+
+      completionResult.xp_delta = xpDelta;
+      completionResult.total_xp = nextXp;
+    } else {
+      completionResult.xp_delta = 0;
+    }
 
     // Auto-recompute parent goal.progress (also fires SQL trigger on deployed env)
     if (habit.data.goal_id) {
@@ -731,12 +825,18 @@ export class DashboardRepository {
       }
     }
 
-    return result.data;
+    return completionResult;
   }
 
-  async today(userId: string) {
+  async today(userId: string, tzOffset?: number) {
     const goals = await new GoalRepository().list(userId);
-    const today = new Date().toISOString().slice(0, 10);
+    // Allow frontend to pass timezone offset, fallback to UTC
+    let todayDate = new Date();
+    if (tzOffset !== undefined) {
+      // Create a date that represents the user's local day by adding the offset minutes
+      todayDate = new Date(Date.now() - (tzOffset * 60 * 1000));
+    }
+    const today = todayDate.toISOString().slice(0, 10);
     const dayKey = scheduleDays[new Date(`${today}T00:00:00`).getDay()]!;
 
     const completions = await supabaseAdmin
@@ -1119,11 +1219,24 @@ export class NotificationRepository {
   }
 }
 
+export const MAX_COACH_SESSIONS = 10;
+
 export class CoachRepository {
   private async assertSessionOwner(userId: string, sessionId: string) {
     const result = await supabaseAdmin.from("coach_sessions").select("id").eq("id", sessionId).eq("user_id", userId).maybeSingle();
     assertDatabaseResult(result.error);
     if (!result.data) throw new AppError("Coach session not found.", 404);
+  }
+  async session(userId: string, sessionId: string) {
+    const result = await supabaseAdmin
+      .from("coach_sessions")
+      .select("id,title,created_at,updated_at")
+      .eq("id", sessionId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    assertDatabaseResult(result.error);
+    if (!result.data) throw new AppError("Coach session not found.", 404);
+    return result.data;
   }
   async sessions(userId: string) {
     const result = await supabaseAdmin
@@ -1151,6 +1264,22 @@ export class CoachRepository {
     return rows.map((r) => ({ ...r, message_count: map.get(r.id) ?? 0 }));
   }
   async createSession(userId: string, title = "New Session") {
+    // Session limiting: cap max sessions per user
+    const existing = await supabaseAdmin
+      .from("coach_sessions")
+      .select("id")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
+    
+    const rows = existing.data ?? [];
+    if (rows.length >= MAX_COACH_SESSIONS) {
+      // Remove oldest overflow sessions
+      const toDelete = rows.slice(MAX_COACH_SESSIONS - 1).map(r => r.id);
+      if (toDelete.length > 0) {
+        await supabaseAdmin.from("coach_sessions").delete().in("id", toDelete);
+      }
+    }
+
     const result = await supabaseAdmin.from("coach_sessions").insert({ user_id: userId, title }).select("*").single();
     assertDatabaseResult(result.error); return result.data;
   }
@@ -1177,15 +1306,99 @@ export class CoachRepository {
   }
   async messages(userId: string, sessionId: string) {
     await this.assertSessionOwner(userId, sessionId);
-    const result = await supabaseAdmin.from("coach_messages").select("id,role,content,created_at").eq("user_id", userId).eq("session_id", sessionId).order("created_at");
-    assertDatabaseResult(result.error); return result.data ?? [];
+    const result = await supabaseAdmin.from("coach_messages").select("id,role,content,created_at").eq("user_id", userId).eq("session_id", sessionId).order("created_at", { ascending: false }).limit(50);
+    assertDatabaseResult(result.error); 
+    const data = result.data ?? [];
+    return data.reverse();
   }
-  async addMessage(userId: string, sessionId: string, role: string, content: string) {
+  async addMessage(userId: string, sessionId: string, role: string, content: string, embedding?: number[]) {
     await this.assertSessionOwner(userId, sessionId);
-    const result = await supabaseAdmin.from("coach_messages").insert({ user_id:userId,session_id:sessionId,role,content }).select("*").single();
+    const payload: any = { user_id:userId, session_id:sessionId, role, content };
+    
+    // Only add embedding if using a driver that supplies them and it's valid format for pgvector
+    if (embedding && embedding.length > 0) {
+      // Postgres vector format is literally a string array "[0.1, 0.2, ...]"
+      payload.embedding = `[${embedding.join(',')}]`; 
+    }
+    
+    const result = await supabaseAdmin.from("coach_messages").insert(payload).select("*").single();
     assertDatabaseResult(result.error);
     await supabaseAdmin.from("coach_sessions").update({ updated_at: new Date().toISOString() }).eq("id", sessionId).eq("user_id", userId);
     return result.data;
+  }
+  
+  async searchRelevantMessages(userId: string, sessionId: string, embedding: number[], matchCount = 5) {
+    await this.assertSessionOwner(userId, sessionId);
+    const vectorStr = `[${embedding.join(',')}]`;
+    const { data, error } = await supabaseAdmin.rpc("match_coach_messages", {
+      query_embedding: vectorStr,
+      match_threshold: 0.7,
+      match_count: matchCount,
+      p_user_id: userId,
+      p_session_id: sessionId
+    });
+    
+    if (error) {
+      console.warn("[RAG] Vector search error:", error.message);
+      return [];
+    }
+    return data ?? [];
+  }
+
+  async getQuota(userId: string) {
+    const MAX_MESSAGES = 50;
+
+    // Baca data kuota dari profil user
+    const result = await supabaseAdmin
+      .from("user_preferences")
+      .select("coach_quota_used, coach_quota_reset_at")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    assertDatabaseResult(result.error);
+    const pref = result.data;
+
+    let used = pref?.coach_quota_used ?? 0;
+    let resetAt = pref?.coach_quota_reset_at ? new Date(pref.coach_quota_reset_at) : null;
+
+    // Jika waktu saat ini sudah melewati waktu reset, anggap kuota penuh
+    if (resetAt && new Date().getTime() >= resetAt.getTime()) {
+      used = 0;
+      resetAt = null;
+    }
+
+    return {
+      max_messages: MAX_MESSAGES,
+      used_messages: used,
+      remaining_messages: Math.max(0, MAX_MESSAGES - used),
+      reset_at: resetAt ? resetAt.toISOString() : null,
+    };
+  }
+
+  async consumeQuota(userId: string) {
+    const quota = await this.getQuota(userId);
+    const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+
+    // Jika ini pesan pertama (kuota tadinya 0), buat jadwal reset 3 jam ke depan
+    let nextResetAt = quota.reset_at;
+    if (quota.used_messages === 0 || !quota.reset_at) {
+      nextResetAt = new Date(Date.now() + THREE_HOURS_MS).toISOString();
+    }
+
+    const nextUsed = quota.used_messages + 1;
+
+    // Upsert ke user_preferences (hanya mengupdate 2 kolom ini)
+    const result = await supabaseAdmin
+      .from("user_preferences")
+      .upsert({
+        user_id: userId,
+        coach_quota_used: nextUsed,
+        coach_quota_reset_at: nextResetAt,
+      }, { onConflict: "user_id" })
+      .select("coach_quota_used");
+
+    assertDatabaseResult(result.error);
+    return nextUsed;
   }
 }
 

@@ -19,11 +19,13 @@ const subscriptionService = new SubscriptionService();
 
 export const resolveUser: RequestHandler = async (req, _res, next) => {
   try {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    const token = req.cookies?.goalpath_access_token || req.headers.authorization?.replace(/^Bearer\s+/i, "");
     if (token) {
       const { data, error } = await supabaseAuth.auth.getUser(token);
-      if (error || !data.user) throw new AppError("Invalid or expired access token.", 401);
-      req.userId = data.user.id;
+      // Skip throwing error here so public routes like /auth/refresh can still process expired tokens.
+      if (!error && data?.user) {
+        req.userId = data.user.id;
+      }
     }
     // SECURE: Removed config.defaultUserId bypass
     next();
