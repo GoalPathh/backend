@@ -83,6 +83,7 @@ export class SubscriptionFacade {
   handleWebhook(notification: unknown) {
     return this.service.handleWebhook(notification as Parameters<SubscriptionService["handleWebhook"]>[0]);
   }
+  refreshReconciled(userId: string) { return this.service.refreshReconciled(userId); }
   cancel(userId: string) { return this.service.cancel(userId); }
 
   assertCanCreateGoal(userId: string) { return this.service.assertCanCreateGoal(userId); }

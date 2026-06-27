@@ -11,6 +11,7 @@ import {
 } from "../dto/subscription.js";
 import {
   createSnapTransaction,
+  getTransactionStatus,
   mapMidtransStatus,
   verifyMidtransSignature,
   type InternalPaymentStatus,
@@ -22,6 +23,33 @@ import {
  * and feature gating helpers used by both routes and middleware.
  */
 export class SubscriptionService {
+  /**
+   * Per-user Promise chain that serializes `activatePremium` calls so
+   * concurrent activations (e.g. two browser tabs opening goals after a
+   * payment, or parallel webhook + active-pull) cannot clobber each
+   * other's `current_period_end` math. Within a single Node process this
+   * is sufficient. For multi-replica deployments, replace with a Postgres
+   * advisory lock (`pg_advisory_xact_lock(hashtext(user_id))`) so the
+   * serialization happens across processes too.
+   */
+  private readonly activationQueues = new Map<string, Promise<void>>();
+
+  private serializeActivation<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.activationQueues.get(userId) ?? Promise.resolve();
+    // Run fn either way (resolve or reject from prev) so a previous failure
+    // doesn't poison the queue forever for that user.
+    const next = prev.then(fn, fn);
+    this.activationQueues.set(
+      userId,
+      next.finally(() => {
+        if (this.activationQueues.get(userId) === next) {
+          this.activationQueues.delete(userId);
+        }
+      }),
+    );
+    return next;
+  }
+
   async getMySubscription(userId: string): Promise<SubscriptionResponse> {
     const row = await this.fetchSubscriptionRow(userId);
     const { tier, status } = this.resolveEffectiveTier(row);
@@ -162,11 +190,23 @@ export class SubscriptionService {
   }
 
   async activatePremium(userId: string, orderId: string): Promise<void> {
+    // Per-user serialization prevents concurrent activations from racing on
+    // the read-then-upsert pattern below. Caller path is safe to invoke
+    // without the lock; this method is the single entrypoint.
+    await this.serializeActivation(userId, () => this.activatePremiumInner(userId, orderId));
+  }
+
+  private async activatePremiumInner(userId: string, orderId: string): Promise<void> {
     const now = new Date();
     const candidateEnd = new Date(now.getTime() + config.premiumPeriodDays * 24 * 60 * 60 * 1000);
 
-    // Period preservation: if the user already has time remaining, extend from
-    // the maximum of (now + period) and (current_end) so renewals don't lose days.
+    // Period preservation: if the user is still in an active paid window
+    // that extends beyond NOW, every new settlement adds another full
+    // period on top of the existing end — so two quick renewals stack
+    // into 2 × PREMIUM_PERIOD_DAYS instead of silently overwriting each
+    // other. The previous form was `existingEnd > candidateEnd`, which
+    // failed for back-to-back settlements because the second's
+    // candidateEnd was always within milliseconds of the first's.
     const current = await supabaseAdmin
       .from("subscriptions")
       .select("current_period_end, status")
@@ -175,8 +215,9 @@ export class SubscriptionService {
     const existingEnd = current.data?.current_period_end
       ? new Date(String(current.data.current_period_end))
       : null;
+    const isStillActive = current.data?.status === "active";
     const finalEnd =
-      existingEnd && existingEnd > candidateEnd && current.data?.status === "active"
+      existingEnd && existingEnd > now && isStillActive
         ? new Date(existingEnd.getTime() + config.premiumPeriodDays * 24 * 60 * 60 * 1000)
         : candidateEnd;
 
@@ -209,10 +250,188 @@ export class SubscriptionService {
     }
   }
 
+  /**
+   * Active-pull reconciliation fallback for environments where Midtrans
+   * webhooks cannot reach the backend (e.g. localhost dev without a tunnel).
+   *
+   * For each pending payment_transactions row owned by this user that's
+   * younger than PENDING_WINDOW_DAYS and whose updated_at hasn't been
+   * touched in RECONCILE_DEBOUNCE_MS, we ask Midtrans Core API for the
+   * authoritative transaction_status and:
+   *
+   *   - settlement: atomic UPDATE on payment_transactions (mirroring the
+   *     webhook idempotency guard) + activatePremium
+   *   - cancelled: mark local row as cancelled so we don't keep polling
+   *   - pending / 404: leave it for the next refresh
+   *
+   * Returns the effective subscription snapshot so the caller can render
+   * Premium status immediately without a follow-up /subscription GET.
+   */
+  async refreshReconciled(userId: string): Promise<SubscriptionResponse> {
+    const RECONCILE_DEBOUNCE_MS = 10_000;
+    const PENDING_WINDOW_DAYS = 7;
+    const sinceDate = new Date(
+      Date.now() - PENDING_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+    ).toISOString();
+
+    const pendingResult = await supabaseAdmin
+      .from("payment_transactions")
+      .select("order_id, gross_amount, updated_at, status")
+      .eq("user_id", userId)
+      .eq("status", "pending")
+      .gte("created_at", sinceDate)
+      .order("created_at", { ascending: true });
+
+    if (pendingResult.error) {
+      console.warn(
+        "[Subscription] refreshReconciled query error:",
+        pendingResult.error.message,
+      );
+    }
+
+    const pending = (pendingResult.data ?? []) as Array<{
+      order_id: string;
+      gross_amount: string | number;
+      updated_at: string;
+    }>;
+
+    // Sequential (for…of), not Promise.all: activatePremium reads+extends
+    // current_period_end inside a loop, so concurrent calls would race and
+    // only one extension might land. Sequential guarantees 5 successful
+    // settlements add up to 5 × PREMIUM_PERIOD_DAYS of premium time.
+    for (const txn of pending) {
+      const lastUpdateMs = new Date(txn.updated_at).getTime();
+      if (Date.now() - lastUpdateMs < RECONCILE_DEBOUNCE_MS) continue;
+
+      try {
+        const remote = await getTransactionStatus(txn.order_id);
+
+        // Cross-check gross_amount so a tampered Midtrans response (or a
+        // stale DB row) can't trigger premium activation for the wrong price.
+        // Midtrans always returns the value as a string with exactly two
+        // fractional digits ("150000.00"). Postgres numeric(12,2) may
+        // serialize with or without the trailing zeros, so we normalize to
+        // a fixed-format string before comparing.
+        //
+        // NaN guard: `Number("abc").toFixed(2)` is the literal string
+        // "NaN", so `"NaN" === "NaN"` would falsely pass and activate
+        // premium even when amounts are unparseable. We also use
+        // `parseFloat(String(...))` rather than coercion: a partial
+        // parse like `"150000abc"` otherwise silently coerces to 150000
+        // via `Number()`, falsely matching the local 150000 and
+        // activating premium on a tampered amount. parseFloat returns
+        // NaN for trailing garbage only when the leading bytes aren't
+        // numeric, so we still need `Number.isFinite` after the call.
+        const nRemote = parseFloat(String(remote.gross_amount));
+        const nLocal = parseFloat(String(txn.gross_amount));
+        if (!Number.isFinite(nRemote) || !Number.isFinite(nLocal)) {
+          console.warn(
+            `[Subscription] reconcile: order ${txn.order_id} has non-finite gross_amount (remote=${String(remote.gross_amount)}, db=${String(txn.gross_amount)}). Skipping.`,
+          );
+          continue;
+        }
+        const remoteNorm = nRemote.toFixed(2);
+        const localNorm = nLocal.toFixed(2);
+        if (remoteNorm !== localNorm) {
+          console.warn(
+            `[Subscription] reconcile: order ${txn.order_id} gross_amount mismatch (remote=${remoteNorm}, db=${localNorm}). Skipping.`,
+          );
+          continue;
+        }
+
+        const status = mapMidtransStatus(remote.transaction_status);
+
+        if (status === "settlement") {
+          // Atomic UPDATE mirrors the webhook idempotency guard so a real
+          // webhook that arrives concurrently won't double-activate.
+          const updateResult = await supabaseAdmin
+            .from("payment_transactions")
+            .update({
+              status,
+              payment_type: remote.payment_type ?? null,
+              transaction_id: remote.transaction_id ?? null,
+              fraud_status: remote.fraud_status ?? null,
+              raw_notification: remote as Record<string, unknown>,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("order_id", txn.order_id)
+            .neq("status", "settlement")
+            .select("order_id");
+
+          if (updateResult.error) {
+            console.warn(
+              `[Subscription] reconcile update error for ${txn.order_id}:`,
+              updateResult.error.message,
+            );
+            continue;
+          }
+
+          const appliedRows = updateResult.data ?? [];
+          if (appliedRows.length > 0) {
+            await this.activatePremium(userId, txn.order_id);
+            console.info(
+              `[Subscription] reconcile activated premium for order ${txn.order_id}`,
+            );
+          }
+        } else if (status === "cancelled") {
+          await supabaseAdmin
+            .from("payment_transactions")
+            .update({ status, updated_at: new Date().toISOString() })
+            .eq("order_id", txn.order_id)
+            .neq("status", "settlement");
+        }
+        // status === "pending" → Midtrans still waiting; leave for next refresh.
+      } catch (err) {
+        const e = err as AppError;
+        if (e instanceof AppError && e.statusCode === 404) {
+          // Order never registered at Midtrans (user closed Snap too fast
+          // or order was purged). Mark cancelled so we stop polling it.
+          await supabaseAdmin
+            .from("payment_transactions")
+            .update({ status: "cancelled", updated_at: new Date().toISOString() })
+            .eq("order_id", txn.order_id)
+            .neq("status", "settlement");
+          continue;
+        }
+        console.warn(
+          `[Subscription] reconcile failed for ${txn.order_id}:`,
+          e.message,
+        );
+      }
+    }
+
+    return this.getMySubscription(userId);
+  }
+
   // ───────── Hard limit gates (called inside repositories/routes) ─────────
 
+  /**
+   * Premium gate that opportunistically reconciles pending payments before
+   * reporting "not premium". Without this, a user who just paid in a dev
+   * environment where the Midtrans webhook cannot reach the backend would
+   * be stuck on /me seeing "Free" AND hit 402 errors on goal/habit/coach
+   * gates even though they legitimately have an in-flight settlement.
+   *
+   * `refreshReconciled` is internally debounced to 10s per pending row, so
+   * hammering the API after each route doesn't spam Midtrans GET calls.
+   */
+  private async checkPremiumByReconciling(
+    userId: string,
+  ): Promise<{ active: boolean; tier: SubscriptionTier }> {
+    const initial = await this.isPremiumActive(userId);
+    if (initial.active) return initial;
+    await this.refreshReconciled(userId).catch((err) => {
+      // Reconciliation must never block a gate; log and fall through.
+      console.warn(
+        "[Subscription] opportunistic reconcile failed:",
+        (err as Error).message,
+      );
+    });
+    return this.isPremiumActive(userId);
+  }
+
   async assertCanCreateGoal(userId: string): Promise<void> {
-    const premium = await this.isPremiumActive(userId);
+    const premium = await this.checkPremiumByReconciling(userId);
     if (premium.active) return;
     const { count } = await supabaseAdmin
       .from("goals")
@@ -227,7 +446,7 @@ export class SubscriptionService {
   }
 
   async assertCanCreateHabit(userId: string, goalId: string): Promise<void> {
-    const premium = await this.isPremiumActive(userId);
+    const premium = await this.checkPremiumByReconciling(userId);
     if (premium.active) return;
     const { count } = await supabaseAdmin
       .from("habits")
@@ -243,7 +462,7 @@ export class SubscriptionService {
   }
 
   async assertCanSendCoachMessage(userId: string): Promise<void> {
-    const premium = await this.isPremiumActive(userId);
+    const premium = await this.checkPremiumByReconciling(userId);
     if (premium.active) return;
     const today = new Date().toISOString().slice(0, 10);
     const startOfDay = `${today}T00:00:00.000Z`;
@@ -261,7 +480,7 @@ export class SubscriptionService {
   }
 
   async assertPremium(userId: string): Promise<void> {
-    const premium = await this.isPremiumActive(userId);
+    const premium = await this.checkPremiumByReconciling(userId);
     if (!premium.active) {
       throw new AppError(
         "Fitur ini khusus member Premium. Silakan upgrade akun Anda untuk membuka akses.",

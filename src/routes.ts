@@ -353,6 +353,8 @@ apiRouter.post("/subscription/webhook", async (q, r) => {
 });
 
 apiRouter.get("/subscription", requireUser, async (q, r) => {
+  // Fast read endpoint — no Midtrans GET, just emit the current DB state.
+  // Reconcile happens lazily via POST /subscription/refresh.
   return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
 });
 
@@ -368,7 +370,12 @@ apiRouter.post("/subscription/checkout", requireUser, async (q, r) => {
 
 apiRouter.post("/subscription/refresh", requireUser, async (q, r) => {
   // Re-read subscription tier from DB (e.g. after returning from Midtrans finish URL).
-  return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
+  // Dev-mode localhost fallback: actively pull authoritative status from
+  // Midtrans for any pending transactions owned by this user, then activate
+  // premium if Midtrans reports settlement. In production with a working
+  // webhook arriving concurrently, the atomic guard inside
+  // refreshReconciled makes this a no-op for already-settled rows.
+  return r.json({ data: await subscriptions.refreshReconciled(q.userId!) });
 });
 
 apiRouter.post("/subscription/cancel", requireUser, async (q, r) => {
