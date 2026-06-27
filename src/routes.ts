@@ -195,6 +195,7 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
         : payload.habits[0]!.title;
 
       const category = payload.category ?? "other";
+      const userConfirmation = `Saya konfirmasi goal: ${title}`;
 
       const goalRepo = new GoalRepository();
       const created = await goalRepo.create(userId, {
@@ -226,7 +227,7 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
           : [],
       });
 
-      await coach.addMessage(userId, sessionId, "user", input.content);
+      await coach.addMessage(userId, sessionId, "user", userConfirmation);
       const habitSummary = payload.habits.map(h => `• ${h.title} (${h.duration_minutes}m, ${h.difficulty})`).join("\n");
       const daySummary = activeDays.join(", ");
       const reply = `🎯 Goal "${(created as any).title}" berhasil dibuat!\n\nKebiasaan:\n${habitSummary}\n\nAktif: ${daySummary}${payload.schedule?.reminderTime ? ` • ${payload.schedule.reminderTime}` : ""}`;
