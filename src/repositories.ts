@@ -1345,60 +1345,48 @@ export class CoachRepository {
     return data ?? [];
   }
 
-  async getQuota(userId: string) {
-    const MAX_MESSAGES = 50;
+  /**
+   * Daily-UTC quota for the AI Coach.
+   *
+   * Source of truth = the `coach_messages` table itself (count rows where
+   * `user_id = $userId AND created_at >= today_utc_start`). This intentionally
+   * matches the counter `subscriptionService.assertCanSendCoachMessage` uses,
+   * so the UI badge and the assertion cannot disagree — they're literally the
+   * same query against the same table.
+   *
+   * The previous 3-hour rolling-window mechanism that wrote to
+   * `user_preferences.coach_quota_*` has been removed: it duplicated state,
+   * drifted out of sync with the assertion, and could let a user pass
+   * `assertCanSendCoachMessage` at the daily cap while showing 50 messages
+   * remaining in the UI (and vice versa). Daily reset is also more intuitive
+   * for users than a rolling 3-hour bucket.
+   *
+   * The caller (route layer) supplies the tier-resolved cap. The repository
+   * no longer reaches into the subscription table; that's a stricter
+   * separation-of-concerns and lets `RoleService` decide *what* the limit
+   * is while the repository just *counts*.
+   */
+  async getQuota(userId: string, maxMessagesPerDay: number, accessPercentage: number) {
+    const today = new Date().toISOString().slice(0, 10);
+    const startOfDay = `${today}T00:00:00.000Z`;
 
-    // Baca data kuota dari profil user
-    const result = await supabaseAdmin
-      .from("user_preferences")
-      .select("coach_quota_used, coach_quota_reset_at")
+    const { count, error } = await supabaseAdmin
+      .from("coach_messages")
+      .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
-      .maybeSingle();
+      .gte("created_at", startOfDay);
+    assertDatabaseResult(error);
 
-    assertDatabaseResult(result.error);
-    const pref = result.data;
-
-    let used = pref?.coach_quota_used ?? 0;
-    let resetAt = pref?.coach_quota_reset_at ? new Date(pref.coach_quota_reset_at) : null;
-
-    // Jika waktu saat ini sudah melewati waktu reset, anggap kuota penuh
-    if (resetAt && new Date().getTime() >= resetAt.getTime()) {
-      used = 0;
-      resetAt = null;
-    }
-
+    const used = count ?? 0;
+    const remaining = Math.max(0, maxMessagesPerDay - used);
     return {
-      max_messages: MAX_MESSAGES,
+      max_messages: maxMessagesPerDay,
       used_messages: used,
-      remaining_messages: Math.max(0, MAX_MESSAGES - used),
-      reset_at: resetAt ? resetAt.toISOString() : null,
+      remaining_messages: remaining,
+      access_percentage: accessPercentage,
+      reset_at: `${today}T23:59:59.999Z`,
+      window: "daily-utc" as const,
     };
-  }
-
-  async consumeQuota(userId: string) {
-    const quota = await this.getQuota(userId);
-    const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
-
-    // Jika ini pesan pertama (kuota tadinya 0), buat jadwal reset 3 jam ke depan
-    let nextResetAt = quota.reset_at;
-    if (quota.used_messages === 0 || !quota.reset_at) {
-      nextResetAt = new Date(Date.now() + THREE_HOURS_MS).toISOString();
-    }
-
-    const nextUsed = quota.used_messages + 1;
-
-    // Upsert ke user_preferences (hanya mengupdate 2 kolom ini)
-    const result = await supabaseAdmin
-      .from("user_preferences")
-      .upsert({
-        user_id: userId,
-        coach_quota_used: nextUsed,
-        coach_quota_reset_at: nextResetAt,
-      }, { onConflict: "user_id" })
-      .select("coach_quota_used");
-
-    assertDatabaseResult(result.error);
-    return nextUsed;
   }
 }
 

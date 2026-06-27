@@ -6,20 +6,65 @@
 export type SubscriptionTier = "free" | "premium";
 export type SubscriptionStatus = "pending" | "active" | "expired" | "cancelled";
 
-/** Numeric limits for the free tier. Premium uses `null` (meaning unlimited). */
+/**
+ * Numeric limits for the free tier. Premium uses `null` (meaning unlimited).
+ * `coachMessagesPerDay` used to live here as a hardcoded free cap (=10) but
+ * was migrated to a tier-percentage system (`COACH_TIER_ACCESS_PERCENTAGE`).
+ * Goals/habits are still asymmetric (free = hard cap, premium = unlimited)
+ * because those count toward product surface area, not LLM cost.
+ */
 export const FREE_LIMITS = {
   goals: 3,
   habitsPerGoal: 5,
-  coachMessagesPerDay: 10,
 } as const;
+
+/** ─── Coach access pricing ───────────────────────────────────────────────
+ * Both tiers now have a CONCRETE per-day cap (Fair Use Policy). The cap is
+ * derived from a single `COACH_BASELINE_MESSAGES_PER_DAY` (representing
+ * "100% Premium access") multiplied by a per-tier percentage. To raise the
+ * ceiling for everyone, edit the baseline; to widen the gap between tiers,
+ * adjust `COACH_TIER_ACCESS_PERCENTAGE`.
+ */
+export const COACH_BASELINE_MESSAGES_PER_DAY = 50;
+export const COACH_TIER_ACCESS_PERCENTAGE: Record<SubscriptionTier, number> = {
+  free: 0.10,
+  premium: 1.0,
+};
+
+export interface CoachAccessRule {
+  /** concrete upper bound enforced per UTC day */
+  maxMessagesPerDay: number;
+  /** the percentage of baseline this tier enjoys (10, 50, 100, ...) */
+  accessPercentage: number;
+}
+
+/**
+ * Resolve the coach access policy for a given tier. The math is:
+ *
+ *     maxMessagesPerDay    = round(baseline × tierPercentage)
+ *     accessPercentage     = round(tierPercentage × 100)
+ *
+ * Both tiers return CONCRETE numbers now (premium is no longer `null`) so
+ * the assert at message-send time, the quota badge UI, and the marketing
+ * copy stay numerically consistent — and there's a single knob to tune.
+ */
+export function resolveCoachAccess(tier: SubscriptionTier): CoachAccessRule {
+  const pct = COACH_TIER_ACCESS_PERCENTAGE[tier];
+  return {
+    maxMessagesPerDay: Math.round(COACH_BASELINE_MESSAGES_PER_DAY * pct),
+    accessPercentage: Math.round(pct * 100),
+  };
+}
 
 export interface SubscriptionLimits {
   /** max active goals; null = unlimited */
   maxGoals: number | null;
   /** max habits per single goal; null = unlimited */
   maxHabitsPerGoal: number | null;
-  /** max user->coach messages per user per UTC day; null = unlimited */
-  maxCoachMessagesPerDay: number | null;
+  /** max user->coach messages per user per UTC day (Fair Use Policy; never null) */
+  maxCoachMessagesPerDay: number;
+  /** the percentage of the coach baseline this tier enjoys (10 | 100) */
+  coachAccessPercentage: number;
 }
 
 export interface PlanFeatures {
@@ -51,7 +96,7 @@ export const PLAN_MATRIX: Record<SubscriptionTier, { limits: SubscriptionLimits;
     limits: {
       maxGoals: FREE_LIMITS.goals,
       maxHabitsPerGoal: FREE_LIMITS.habitsPerGoal,
-      maxCoachMessagesPerDay: FREE_LIMITS.coachMessagesPerDay,
+      ...resolveCoachAccess("free"),
     },
     features: {
       unlimitedGoals: false,
@@ -67,7 +112,7 @@ export const PLAN_MATRIX: Record<SubscriptionTier, { limits: SubscriptionLimits;
     limits: {
       maxGoals: null,
       maxHabitsPerGoal: null,
-      maxCoachMessagesPerDay: null,
+      ...resolveCoachAccess("premium"),
     },
     features: {
       unlimitedGoals: true,

@@ -25,6 +25,13 @@ const MIDTRANS_BASE = config.midtransIsProduction
   ? "https://app.midtrans.com"
   : "https://app.sandbox.midtrans.com";
 
+// Midtrans Core/REST API base — for transaction-status queries and any
+// non-Snap server-to-server calls. Different subdomain from MIDTRANS_BASE
+// (which is for the Snap checkout popup and its token endpoint).
+const MIDTRANS_API_BASE = config.midtransIsProduction
+  ? "https://api.midtrans.com"
+  : "https://api.sandbox.midtrans.com";
+
 function buildAuthHeader(): string {
   if (!config.midtransServerKey) {
     throw new AppError(
@@ -120,6 +127,69 @@ export function verifyMidtransSignature(payload: {
   const input = `${payload.order_id}${payload.status_code}${payload.gross_amount}${config.midtransServerKey}`;
   const expected = createHash("sha512").update(input).digest("hex");
   return expected === payload.signature_key;
+}
+
+/**
+ * Fetch authoritative transaction status from Midtrans Core API.
+ *
+ * Use case: dev environments where Midtrans webhooks cannot reach the
+ * backend (localhost without a tunnel). The webhook handler stays as the
+ * source of truth in production; this GET is a one-shot reconciliation
+ * trigger we fire when the client asks for /subscription/refresh.
+ *
+ * Authenticated with Basic auth (server key as username, empty password),
+ * same as createSnapTransaction. There is no signature to verify because
+ * WE initiated the request — TLS plus server-key-authenticated response
+ * is enough. We additionally cross-check `gross_amount` against our DB row
+ * so a tampered Midtrans response can't activate premium for the wrong
+ * amount.
+ */
+export interface MidtransTransactionStatus {
+  transaction_status: string;
+  status_code: string;
+  gross_amount: string;
+  payment_type?: string;
+  transaction_id?: string;
+  fraud_status?: string;
+  [key: string]: unknown;
+}
+
+export async function getTransactionStatus(orderId: string): Promise<MidtransTransactionStatus> {
+  if (!config.midtransServerKey) {
+    throw new AppError("Midtrans server key is not configured.", 503);
+  }
+  const response = await fetch(
+    `${MIDTRANS_API_BASE}/v2/${encodeURIComponent(orderId)}/status`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization:
+          "Basic " + Buffer.from(`${config.midtransServerKey}:`).toString("base64"),
+      },
+    },
+  );
+
+  if (response.status === 404) {
+    // Midtrans says the order_id is unknown / has been purged. Surface a
+    // typed error so the caller can mark the local row as cancelled.
+    throw new AppError(`Order ${orderId} not found at Midtrans.`, 404);
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    console.error(
+      "[Midtrans] status query failed:",
+      response.status,
+      text.slice(0, 400),
+    );
+    throw new AppError(
+      `Midtrans status query failed: ${response.status}. Check MIDTRANS_SERVER_KEY and MIDTRANS_IS_PRODUCTION.`,
+      502,
+    );
+  }
+
+  return (await response.json()) as MidtransTransactionStatus;
 }
 
 /** Map Midtrans transaction_status onto our internal payment_transactions.status enum. */

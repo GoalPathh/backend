@@ -35,7 +35,16 @@ export class GoalService { constructor(private repo=new GoalRepository()){} list
 export class UserService { constructor(private repo=new UserRepository()){} overview(u:string){return this.repo.overview(u)} profile(u:string){return this.repo.profile(u)} updateProfile(u:string,i:unknown){return this.repo.updateProfile(u,i)} preferences(u:string){return this.repo.preferences(u)} updatePreferences(u:string,i:unknown){return this.repo.updatePreferences(u,i)} avatarUploadSignature(u:string){return this.repo.createAvatarUploadSignature(u)} }
 export class DashboardService { constructor(private repo=new DashboardRepository()){} today(u:string,tz?:number){return this.repo.today(u,tz)} getUserContextSnapshot(u:string){return this.repo.getUserContextSnapshot(u)} setCompletion(u:string,id:string,c:boolean,d?:string){return this.repo.setCompletion(u,id,c,d)} progressDash(u:string){return this.repo.getProgressDash(u)} progressOverview(u:string,range:string){return this.repo.getProgressOverview(u,range)} goalPerformance(u:string){return this.repo.getGoalPerformance(u)} recomputeGoal(u:string,id:string){return this.repo.recomputeGoalProgress(u,id)} }
 export class NotificationService { constructor(private repo=new NotificationRepository()){} list(u:string){return this.repo.list(u)} markAllRead(u:string){return this.repo.markAllRead(u)} }
-export class CoachService { constructor(private repo=new CoachRepository()){} session(u:string,id:string){return this.repo.session(u,id)} sessions(u:string){return this.repo.sessions(u)} createSession(u:string,title?:string){return this.repo.createSession(u,title)} renameSession(u:string,id:string,title:string){return this.repo.renameSession(u,id,title)} deleteSession(u:string,id:string){return this.repo.deleteSession(u,id)} messages(u:string,id:string){return this.repo.messages(u,id)} addMessage(u:string,id:string,role:string,content:string,emb?:number[]){return this.repo.addMessage(u,id,role,content,emb)} searchContext(u:string,id:string,emb:number[],matchCount=5){return this.repo.searchRelevantMessages(u,id,emb,matchCount)} getQuota(u:string){return this.repo.getQuota(u)} consumeQuota(u:string){return this.repo.consumeQuota(u)} }
+export class CoachService { constructor(private repo=new CoachRepository()){} session(u:string,id:string){return this.repo.session(u,id)} sessions(u:string){return this.repo.sessions(u)} createSession(u:string,title?:string){return this.repo.createSession(u,title)} renameSession(u:string,id:string,title:string){return this.repo.renameSession(u,id,title)} deleteSession(u:string,id:string){return this.repo.deleteSession(u,id)} messages(u:string,id:string){return this.repo.messages(u,id)} addMessage(u:string,id:string,role:string,content:string,emb?:number[]){return this.repo.addMessage(u,id,role,content,emb)} searchContext(u:string,id:string,emb:number[],matchCount=5){return this.repo.searchRelevantMessages(u,id,emb,matchCount)}  /**
+   * Daily quota snapshot. `maxMessagesPerDay` and `accessPercentage` are
+   * resolved by the caller (route layer) from `subscriptionService` so the
+   * CoachRepository doesn't have to know about tier policy. Keeping policy
+   * out of the data layer is what lets
+   * `subscriptionService.assertCanSendCoachMessage` stay the single
+   * enforcement point.
+   */
+  getQuota(u: string, maxMessagesPerDay: number, accessPercentage: number) { return this.repo.getQuota(u, maxMessagesPerDay, accessPercentage); }
+}
 export class PersonaService {
   constructor(private repo = new PersonaRepository()) {}
 
@@ -83,6 +92,7 @@ export class SubscriptionFacade {
   handleWebhook(notification: unknown) {
     return this.service.handleWebhook(notification as Parameters<SubscriptionService["handleWebhook"]>[0]);
   }
+  refreshReconciled(userId: string) { return this.service.refreshReconciled(userId); }
   cancel(userId: string) { return this.service.cancel(userId); }
 
   assertCanCreateGoal(userId: string) { return this.service.assertCanCreateGoal(userId); }
