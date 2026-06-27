@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import {
   FREE_LIMITS,
   PLAN_MATRIX,
+  resolveCoachAccess,
   type SubscriptionResponse,
   type SubscriptionTier,
   type PlanFeatures,
@@ -463,8 +464,15 @@ export class SubscriptionService {
   }
 
   async assertCanSendCoachMessage(userId: string): Promise<void> {
+    // Resolves tier FIRST (with opportunistic reconcile for pending payments)
+    // so that a freshly-paid-in-Sandbox user whose Midtrans webhook can't
+    // reach the backend isn't stranded on the Free cap while waiting.
     const premium = await this.checkPremiumByReconciling(userId);
-    if (premium.active) return;
+    const access = resolveCoachAccess(premium.tier);
+
+    // Both tiers are now bounded by a Fair-Use cap (free=5, premium=50/day).
+    // Premium is no longer unlimited — the cap protects LLM cost while still
+    // feeling like "full access" for genuine power-users.
     const today = new Date().toISOString().slice(0, 10);
     const startOfDay = `${today}T00:00:00.000Z`;
     const { count } = await supabaseAdmin
@@ -472,9 +480,13 @@ export class SubscriptionService {
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
       .gte("created_at", startOfDay);
-    if ((count ?? 0) >= FREE_LIMITS.coachMessagesPerDay) {
+    if ((count ?? 0) >= access.maxMessagesPerDay) {
       throw new AppError(
-        `Batas tier Free tercapai. Maksimal ${FREE_LIMITS.coachMessagesPerDay} pesan coach per hari. Upgrade ke Premium untuk akses tanpa batas.`,
+        `Batas akses coach tercapai: ${access.accessPercentage}% akses (` +
+          `${access.maxMessagesPerDay} pesan/hari). ` +
+          (premium.active
+            ? "Limit ini berlaku untuk semua member sebagai Fair Use Policy."
+            : "Upgrade ke Premium untuk akses 100% (50 pesan/hari)."),
         402,
       );
     }

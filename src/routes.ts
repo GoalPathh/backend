@@ -130,7 +130,19 @@ apiRouter.patch("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.pars
 apiRouter.delete("/coach/sessions/:id",requireUser,async(q,r)=>{const sid=id.parse(q.params.id);await coach.deleteSession(q.userId!,sid);return r.status(204).send();});
 apiRouter.get("/coach/sessions/:id",requireUser,async(q,r)=>r.json({data:await coach.session(q.userId!,id.parse(q.params.id))}));
 apiRouter.get("/coach/sessions/:id/messages",requireUser,async(q,r)=>r.json({data:await coach.messages(q.userId!,id.parse(q.params.id))}));
-apiRouter.get("/coach/quota",requireUser,async(q,r)=>r.json({data:await coach.getQuota(q.userId!)}));
+apiRouter.get("/coach/quota", requireUser, async (q, r) => {
+  // Resolve access policy from the SAME source the message-send assertion
+  // reads (`subscriptionService`). This way the badge the user sees is
+  // literally the same number their next message will be evaluated against.
+  const sub = await subscriptions.getMySubscription(q.userId!);
+  return r.json({
+    data: await coach.getQuota(
+      q.userId!,
+      sub.limits.maxCoachMessagesPerDay,
+      sub.limits.coachAccessPercentage,
+    ),
+  });
+});
 
 // ── Coach message endpoint ──
 apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
@@ -142,17 +154,12 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
   }).parse(q.body);
 
   // Free-tier daily guardrail: check BEFORE any DB write / LLM call.
+  // Single enforcement point: assertCanSendCoachMessage compares today's
+  // coach_messages count against the tier-resolved cap (free=5/day,
+  // premium=50/day as Fair Use Policy). The legacy 3-hour rolling window
+  // has been removed because the UI badge and this gate now read from the
+  // same coach_messages table — so they cannot disagree.
   await subscriptions.assertCanSendCoachMessage(userId);
-  // --- RATE LIMIT GUARD: Max 50 messages per 3 hours ---
-  const quota = await coach.getQuota(userId);
-  if (quota.remaining_messages <= 0 && quota.reset_at) {
-    const now = new Date().getTime();
-    const resetTime = new Date(quota.reset_at).getTime();
-    if (now < resetTime) {
-      throw new AppError("Limit percakapan tercapai (Maks 50 pesan per 3 jam). Silakan coba lagi nanti.", 429);
-    }
-  }
-  // -----------------------------------------------------
 
   // 0. Detect interactive Goal Wizard submit (skip LLM, persist directly)
   if (input.content.startsWith(GOAL_WIZARD_TAG)) {
