@@ -96,7 +96,8 @@ export const PLAN_MATRIX: Record<SubscriptionTier, { limits: SubscriptionLimits;
     limits: {
       maxGoals: FREE_LIMITS.goals,
       maxHabitsPerGoal: FREE_LIMITS.habitsPerGoal,
-      ...resolveCoachAccess("free"),
+      maxCoachMessagesPerDay: resolveCoachAccess("free").maxMessagesPerDay,
+      coachAccessPercentage: resolveCoachAccess("free").accessPercentage,
     },
     features: {
       unlimitedGoals: false,
@@ -112,7 +113,8 @@ export const PLAN_MATRIX: Record<SubscriptionTier, { limits: SubscriptionLimits;
     limits: {
       maxGoals: null,
       maxHabitsPerGoal: null,
-      ...resolveCoachAccess("premium"),
+      maxCoachMessagesPerDay: resolveCoachAccess("premium").maxMessagesPerDay,
+      coachAccessPercentage: resolveCoachAccess("premium").accessPercentage,
     },
     features: {
       unlimitedGoals: true,

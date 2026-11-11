@@ -1,16 +1,18 @@
-import { supabaseAdmin } from "./supabase.js";
+import { prisma } from "./db.js";
 
-const tables = ["profiles", "user_preferences", "goals", "habits", "habit_completions", "coach_sessions", "coach_messages", "notifications"];
-let failed = false;
-
-for (const table of tables) {
-  const { error } = await supabaseAdmin.from(table).select("*", { head: true, count: "exact" }).limit(1);
-  if (error) {
-    failed = true;
-    console.error(`${table}: ${error.message}`);
-  } else {
-    console.log(`${table}: ok`);
+async function check() {
+  console.log("Checking MySQL connection via Prisma...");
+  try {
+    const userCount = await prisma.user.count();
+    const goalCount = await prisma.goal.count();
+    const habitCount = await prisma.habit.count();
+    console.log(`Database connected successfully!`);
+    console.log(`Counts -> Users: ${userCount}, Goals: ${goalCount}, Habits: ${habitCount}`);
+    await prisma.$disconnect();
+  } catch (error) {
+    console.error("Database connection failed:", error);
+    process.exit(1);
   }
 }
 
-if (failed) process.exitCode = 1;
+check();

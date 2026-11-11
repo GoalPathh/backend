@@ -4,23 +4,13 @@ import { z } from "zod";
 
 loadEnv({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
 
-const rawEnv = {
-  ...process.env,
-  SUPABASE_URL:
-    process.env.SUPABASE_URL ??
-    process.env.NEXT_PUBLIC_SUPABASE_URL ??
-    process.env.PUBLIC_URL,
-  SUPABASE_PUBLISHABLE_KEY:
-    process.env.SUPABASE_PUBLISHABLE_KEY ??
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
-};
-
 const env = z.object({
   PORT: z.coerce.number().default(4000),
   FRONTEND_URL: z.string().default("http://localhost:3000"),
-  SUPABASE_URL: z.string().url(),
-  SUPABASE_PUBLISHABLE_KEY: z.string().min(1),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
+  DATABASE_URL: z.string().min(1),
+  JWT_SECRET: z.string().default("goalpath_jwt_super_secret_key_change_in_prod"),
+  JWT_EXPIRES_IN: z.string().default("15m"),
+  JWT_REFRESH_EXPIRES_IN: z.string().default("30d"),
   DEFAULT_USER_ID: z.preprocess(
     (value) => value === "" ? undefined : value,
     z.string().uuid().optional(),
@@ -28,40 +18,25 @@ const env = z.object({
   LLM_PROVIDER_URL: z.string().url().default("https://generativelanguage.googleapis.com/v1beta/openai"),
   LLM_API_KEY: z.string().default("mock-key"),
   LLM_MODEL: z.string().default("gemini-3.1-flash-lite"),
-  CLOUDINARY_CLOUD_NAME: z.preprocess(
-    (value) => value === "" ? undefined : value,
-    z.string().optional(),
-  ),
-  CLOUDINARY_API_KEY: z.preprocess(
-    (value) => value === "" ? undefined : value,
-    z.string().optional(),
-  ),
-  CLOUDINARY_API_SECRET: z.preprocess(
-    (value) => value === "" ? undefined : value,
-    z.string().optional(),
-  ),
-  CLOUDINARY_UPLOAD_FOLDER: z.preprocess(
-    (value) => value === "" ? undefined : value,
-    z.string().optional(),
-  ),
-  // "raw"   = custom fetch + SSE parser (best for LMStudio / Ollama / TokenRouter / Gemini proxy
-  //           where Vercel SDK's streaming parser has historically mis-handled partial chunks)
-  // "vercel" = ai SDK + @ai-sdk/openai (best for hosted OpenAI / together.ai / groq / vLLM
-  //           that emit strict OpenAI-compatible JSON or SSE)
+  CLOUDINARY_CLOUD_NAME: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
+  CLOUDINARY_API_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
+  CLOUDINARY_API_SECRET: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
+  CLOUDINARY_UPLOAD_FOLDER: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
   LLM_DRIVER: z.enum(["raw", "vercel"]).default("raw"),
   MIDTRANS_SERVER_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
   MIDTRANS_CLIENT_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().optional()),
   MIDTRANS_IS_PRODUCTION: z.preprocess((value) => value === "true" || value === true, z.boolean().default(false)),
   PREMIUM_PRICE_IDR: z.coerce.number().int().min(1).default(150000),
   PREMIUM_PERIOD_DAYS: z.coerce.number().int().min(1).default(30),
-}).parse(rawEnv);
+}).parse(process.env);
 
 export const config = {
   port: env.PORT,
   frontendUrl: env.FRONTEND_URL,
-  supabaseUrl: env.SUPABASE_URL,
-  supabasePublishableKey: env.SUPABASE_PUBLISHABLE_KEY,
-  supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+  databaseUrl: env.DATABASE_URL,
+  jwtSecret: env.JWT_SECRET,
+  jwtExpiresIn: env.JWT_EXPIRES_IN,
+  jwtRefreshExpiresIn: env.JWT_REFRESH_EXPIRES_IN,
   defaultUserId: env.DEFAULT_USER_ID || undefined,
   llmProviderUrl: env.LLM_PROVIDER_URL,
   llmApiKey: env.LLM_API_KEY,

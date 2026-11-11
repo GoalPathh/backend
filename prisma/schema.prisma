@@ -1,0 +1,272 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Users (pengganti auth.users dari Supabase) ───────────────────────────────
+model User {
+  id                  String               @id @default(uuid())
+  email               String               @unique
+  password_hash       String
+  email_verified      Boolean              @default(false)
+  created_at          DateTime             @default(now())
+  updated_at          DateTime             @updatedAt
+
+  profile             Profile?
+  preferences         UserPreference?
+  goals               Goal[]
+  habits              Habit[]
+  habit_completions   HabitCompletion[]
+  coach_sessions      CoachSession[]
+  coach_messages      CoachMessage[]
+  goal_milestones     GoalMilestone[]
+  notifications       Notification[]
+  subscription        Subscription?
+  payment_transactions PaymentTransaction[]
+  persona_profile     PersonaProfile?
+  ai_interventions    AiInterventionLog[]
+
+  @@map("users")
+}
+
+// ─── Profiles ──────────────────────────────────────────────────────────────────
+model Profile {
+  id          String   @id
+  name        String   @default("GoalPath User")
+  username    String   @default("@goalpath")
+  avatar_url  String   @default("")
+  level       Int      @default(1)
+  xp          Int      @default(0)
+  streak_days Int      @default(0)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  user        User     @relation(fields: [id], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+
+// ─── User Preferences ──────────────────────────────────────────────────────────
+model UserPreference {
+  user_id               String   @id
+  appearance            String   @default("system")
+  notifications         Json     @default("[]")
+  coach_quota_used      Int      @default(0)
+  coach_quota_reset_at  DateTime?
+  updated_at            DateTime @updatedAt
+
+  user                  User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+// ─── Goals ─────────────────────────────────────────────────────────────────────
+model Goal {
+  id                      String          @id @default(uuid())
+  user_id                 String
+  title                   String
+  category                String          @default("other")
+  period                  String
+  progress                Decimal         @default(0) @db.Decimal(5, 2)
+  start_date              DateTime
+  target_date             DateTime
+  reminder_enabled        Boolean         @default(true)
+  notification_preference String          @default("all")
+  created_at              DateTime        @default(now())
+  updated_at              DateTime        @updatedAt
+
+  user                    User            @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  habits                  Habit[]
+  goal_milestones         GoalMilestone[]
+
+  @@index([user_id, created_at])
+  @@map("goals")
+}
+
+// ─── Habits ────────────────────────────────────────────────────────────────────
+model Habit {
+  id            String            @id @default(uuid())
+  goal_id       String
+  user_id       String
+  title         String
+  duration      Int
+  difficulty    String
+  time_range    String            @default("anytime")
+  reminder_time String?
+  active_days   Json              @default("[]")
+  priority      String            @default("medium")
+  created_at    DateTime          @default(now())
+
+  goal          Goal              @relation(fields: [goal_id], references: [id], onDelete: Cascade)
+  user          User              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  completions   HabitCompletion[]
+
+  @@index([goal_id])
+  @@map("habits")
+}
+
+// ─── Habit Completions ─────────────────────────────────────────────────────────
+model HabitCompletion {
+  id              String   @id @default(uuid())
+  habit_id        String
+  user_id         String
+  completion_date DateTime @db.Date
+  completed       Boolean  @default(true)
+  completed_at    DateTime @default(now())
+
+  habit           Habit    @relation(fields: [habit_id], references: [id], onDelete: Cascade)
+  user            User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([habit_id, completion_date])
+  @@index([user_id, completion_date])
+  @@map("habit_completions")
+}
+
+// ─── Coach Sessions ────────────────────────────────────────────────────────────
+model CoachSession {
+  id         String         @id @default(uuid())
+  user_id    String
+  title      String         @default("New Session")
+  created_at DateTime       @default(now())
+  updated_at DateTime       @updatedAt
+
+  user       User           @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  messages   CoachMessage[]
+
+  @@index([user_id, updated_at])
+  @@map("coach_sessions")
+}
+
+// ─── Coach Messages ────────────────────────────────────────────────────────────
+model CoachMessage {
+  id         String       @id @default(uuid())
+  session_id String
+  user_id    String
+  role       String
+  content    String       @db.Text
+  embedding  Json?
+  created_at DateTime     @default(now())
+
+  session    CoachSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  user       User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("coach_messages")
+}
+
+// ─── Goal Milestones ───────────────────────────────────────────────────────────
+model GoalMilestone {
+  id           String    @id @default(uuid())
+  goal_id      String
+  user_id      String
+  title        String
+  target_date  DateTime?
+  sort_order   Int       @default(0)
+  completed_at DateTime?
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+
+  goal         Goal      @relation(fields: [goal_id], references: [id], onDelete: Cascade)
+  user         User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([goal_id, sort_order])
+  @@index([user_id])
+  @@map("goal_milestones")
+}
+
+// ─── Notifications ─────────────────────────────────────────────────────────────
+model Notification {
+  id                String    @id @default(uuid())
+  user_id           String
+  type              String
+  title             String
+  message           String    @db.Text
+  source_key        String
+  notification_date DateTime  @db.Date @default(now())
+  read_at           DateTime?
+  metadata          Json      @default("{}")
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+
+  user              User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, type, source_key, notification_date])
+  @@index([user_id, created_at])
+  @@map("notifications")
+}
+
+// ─── Subscriptions ─────────────────────────────────────────────────────────────
+model Subscription {
+  user_id               String    @id
+  tier                  String    @default("free")
+  status                String    @default("active")
+  current_period_start  DateTime?
+  current_period_end    DateTime?
+  auto_renew            Boolean   @default(false)
+  last_payment_order_id String?
+  cancelled_at          DateTime?
+  metadata              Json      @default("{}")
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+
+  user                  User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([tier, status])
+  @@map("subscriptions")
+}
+
+// ─── Payment Transactions ──────────────────────────────────────────────────────
+model PaymentTransaction {
+  order_id         String    @id
+  user_id          String
+  gross_amount     Decimal   @db.Decimal(12, 2)
+  status           String
+  payment_type     String?
+  transaction_id   String?
+  snap_token       String?
+  signature_match  Boolean?
+  fraud_status     String?
+  raw_notification Json?
+  tier             String    @default("premium")
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+
+  user             User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@map("payment_transactions")
+}
+
+// ─── Persona Profiles ──────────────────────────────────────────────────────────
+model PersonaProfile {
+  user_id     String   @id
+  archetype   String
+  traits      Json
+  evidence    Json
+  window_days Int      @default(14)
+  computed_at DateTime @default(now())
+
+  user        User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([archetype])
+  @@map("persona_profiles")
+}
+
+// ─── AI Intervention Log ──────────────────────────────────────────────────────
+model AiInterventionLog {
+  id                String   @id @default(uuid())
+  user_id           String
+  goal_id           String?
+  intervention_type String   @default("stagnant_reminder")
+  created_at        DateTime @default(now())
+
+  user              User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, created_at])
+  @@map("ai_intervention_log")
+}
+
+
