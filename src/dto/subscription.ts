@@ -33,16 +33,16 @@ export const COACH_TIER_ACCESS_PERCENTAGE: Record<SubscriptionTier, number> = {
 
 export interface CoachAccessRule {
   /** concrete upper bound enforced per UTC day */
-  maxMessagesPerDay: number;
+  maxCoachMessagesPerDay: number;
   /** the percentage of baseline this tier enjoys (10, 50, 100, ...) */
-  accessPercentage: number;
+  coachAccessPercentage: number;
 }
 
 /**
  * Resolve the coach access policy for a given tier. The math is:
  *
- *     maxMessagesPerDay    = round(baseline × tierPercentage)
- *     accessPercentage     = round(tierPercentage × 100)
+ *     maxCoachMessagesPerDay = round(baseline × tierPercentage)
+ *     coachAccessPercentage = round(tierPercentage × 100)
  *
  * Both tiers return CONCRETE numbers now (premium is no longer `null`) so
  * the assert at message-send time, the quota badge UI, and the marketing
@@ -51,8 +51,8 @@ export interface CoachAccessRule {
 export function resolveCoachAccess(tier: SubscriptionTier): CoachAccessRule {
   const pct = COACH_TIER_ACCESS_PERCENTAGE[tier];
   return {
-    maxMessagesPerDay: Math.round(COACH_BASELINE_MESSAGES_PER_DAY * pct),
-    accessPercentage: Math.round(pct * 100),
+    maxCoachMessagesPerDay: Math.round(COACH_BASELINE_MESSAGES_PER_DAY * pct),
+    coachAccessPercentage: Math.round(pct * 100),
   };
 }
 

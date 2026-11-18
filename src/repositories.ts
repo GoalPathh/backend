@@ -173,8 +173,10 @@ export class GoalRepository {
   async remove(userId: string, id: string) { await this.find(userId,id); const result = await supabaseAdmin.from("goals").delete().eq("user_id", userId).eq("id", id); assertDatabaseResult(result.error); }
 
   async dashboard(userId: string) {
-    const goals = await this.list(userId);
-    const performance = await new DashboardRepository().getGoalPerformance(userId);
+    const [goals, performance] = await Promise.all([
+      this.list(userId),
+      new DashboardRepository().getGoalPerformance(userId),
+    ]);
     const performanceMap = new Map(performance.map((item: any) => [item.id, item]));
     const goalIds = goals.map((goal: any) => goal.id);
 
@@ -319,18 +321,17 @@ export class UserRepository {
     };
   }
   async overview(userId: string) {
-    const [profile, preferences, goalDashboard, progress] = await Promise.all([
+    const [profile, preferences, goalDashboard, progress, unreadNotificationsResult] = await Promise.all([
       this.profile(userId),
       this.preferences(userId),
       new GoalRepository().dashboard(userId),
       new DashboardRepository().getProgressDash(userId),
+      supabaseAdmin
+        .from("notifications")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .is("read_at", null),
     ]);
-
-    const unreadNotificationsResult = await supabaseAdmin
-      .from("notifications")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .is("read_at", null);
     assertDatabaseResult(unreadNotificationsResult.error);
 
     return {
@@ -360,22 +361,22 @@ export class DashboardRepository {
    *  Idempotent — safe to call after every completion change.
    */
   async recomputeGoalProgress(userId: string, goalId: string): Promise<number> {
-    const { data: goal, error: gErr } = await supabaseAdmin
-      .from("goals")
-      .select("id, start_date")
-      .eq("user_id", userId)
-      .eq("id", goalId)
-      .maybeSingle();
+    const [goalResult, habitsResult] = await Promise.all([
+      supabaseAdmin
+        .from("goals")
+        .select("id, start_date")
+        .eq("user_id", userId)
+        .eq("id", goalId)
+        .maybeSingle(),
+      supabaseAdmin.from("habits").select("id").eq("goal_id", goalId),
+    ]);
+    const { data: goal, error: gErr } = goalResult;
     assertDatabaseResult(gErr);
+    assertDatabaseResult(habitsResult.error);
     if (!goal) return 0;
 
-    const { count: habitsCount, error: hErr } = await supabaseAdmin
-      .from("habits")
-      .select("id", { count: "exact", head: true })
-      .eq("goal_id", goalId);
-    assertDatabaseResult(hErr);
-
-    const habitCount = habitsCount ?? 0;
+    const habitIds = (habitsResult.data ?? []).map((habit) => habit.id);
+    const habitCount = habitIds.length;
     if (habitCount === 0) {
       await supabaseAdmin.from("goals").update({ progress: 0, updated_at: new Date().toISOString() }).eq("id", goalId);
       return 0;
@@ -391,7 +392,7 @@ export class DashboardRepository {
       .eq("completed", true)
       .gte("completion_date", startDay)
       .lte("completion_date", today)
-      .in("habit_id", (await supabaseAdmin.from("habits").select("id").eq("goal_id", goalId)).data?.map((h: any) => h.id) ?? ["00000000-0000-0000-0000-000000000000"]);
+      .in("habit_id", habitIds);
     assertDatabaseResult(cErr);
 
     const expected = habitCount * eligibleDays;
@@ -421,36 +422,21 @@ export class DashboardRepository {
 
     // Fallback to individual queries if RPC is not yet created
     if (rpcError || !rpcData) {
-      const { count: completedLast7 } = await supabaseAdmin
-        .from("habit_completions")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("completed", true)
-        .gte("completion_date", sevenDaysAgo);
-      const { count: missedLast7 } = await supabaseAdmin
-        .from("habit_completions")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("completed", false)
-        .gte("completion_date", sevenDaysAgo);
-      const { count: totalCompletions } = await supabaseAdmin
-        .from("habit_completions")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("completed", true);
-      const { data: goals } = await supabaseAdmin
-        .from("goals")
-        .select("id, progress")
-        .eq("user_id", userId);
+      const [completedResult, missedResult, totalResult, goalsResult, streakResult, profileResult] = await Promise.all([
+        supabaseAdmin.from("habit_completions").select("id", { count: "exact", head: true }).eq("user_id", userId).eq("completed", true).gte("completion_date", sevenDaysAgo),
+        supabaseAdmin.from("habit_completions").select("id", { count: "exact", head: true }).eq("user_id", userId).eq("completed", false).gte("completion_date", sevenDaysAgo),
+        supabaseAdmin.from("habit_completions").select("id", { count: "exact", head: true }).eq("user_id", userId).eq("completed", true),
+        supabaseAdmin.from("goals").select("id").eq("user_id", userId),
+        supabaseAdmin.from("habit_completions").select("completion_date").eq("user_id", userId).eq("completed", true).order("completion_date", { ascending: false }).limit(60),
+        supabaseAdmin.from("profiles").select("xp, streak_days, level").eq("id", userId).maybeSingle(),
+      ]);
+      const completedLast7 = completedResult.count;
+      const missedLast7 = missedResult.count;
+      const totalCompletions = totalResult.count;
+      const goals = goalsResult.data;
       const activeGoals = goals?.length ?? 0;
       // Naive streak: distinct dates with completed=true going back from today
-      const { data: streakRows } = await supabaseAdmin
-        .from("habit_completions")
-        .select("completion_date")
-        .eq("user_id", userId)
-        .eq("completed", true)
-        .order("completion_date", { ascending: false })
-        .limit(60);
+      const streakRows = streakResult.data;
       let streak = 0;
       if (streakRows && streakRows.length > 0) {
         const dates = new Set<string>((streakRows as any[]).map(r => r.completion_date));
@@ -465,7 +451,6 @@ export class DashboardRepository {
       const completionRate = ((completedLast7 ?? 0) + (missedLast7 ?? 0)) > 0
         ? Math.round(((completedLast7 ?? 0) / ((completedLast7 ?? 0) + (missedLast7 ?? 0))) * 100)
         : 0;
-      const profile = await supabaseAdmin.from("profiles").select("xp, streak_days, level").eq("id", userId).maybeSingle();
       return {
         activeGoals,
         habitsCompleted7d: completedLast7 ?? 0,
@@ -474,7 +459,7 @@ export class DashboardRepository {
         currentStreak: streak,
         totalXp,
         completionRate,
-        profile: profile?.data ?? { xp: totalXp, streak_days: streak, level: 1 },
+        profile: profileResult.data ?? { xp: totalXp, streak_days: streak, level: 1 },
       };
     }
 
@@ -755,19 +740,20 @@ export class DashboardRepository {
   }
 
   async setCompletion(userId: string, habitId: string, completed: boolean, completionDate?: string) {
-    const habit = await supabaseAdmin.from("habits").select("id, goal_id").eq("id", habitId).eq("user_id", userId).maybeSingle();
-    assertDatabaseResult(habit.error);
-    if (!habit.data) throw new AppError("Habit not found.", 404);
-
     const targetDate = completionDate ?? new Date().toISOString().slice(0, 10);
-    const existing = await supabaseAdmin
-      .from("habit_completions")
-      .select("id, completed")
-      .eq("habit_id", habitId)
-      .eq("user_id", userId)
-      .eq("completion_date", targetDate)
-      .maybeSingle();
+    const [habit, existing] = await Promise.all([
+      supabaseAdmin.from("habits").select("id, goal_id").eq("id", habitId).eq("user_id", userId).maybeSingle(),
+      supabaseAdmin
+        .from("habit_completions")
+        .select("id, completed")
+        .eq("habit_id", habitId)
+        .eq("user_id", userId)
+        .eq("completion_date", targetDate)
+        .maybeSingle(),
+    ]);
+    assertDatabaseResult(habit.error);
     assertDatabaseResult(existing.error);
+    if (!habit.data) throw new AppError("Habit not found.", 404);
 
     const wasCompleted = Boolean(existing.data?.completed);
     const xpDelta = completed === wasCompleted ? 0 : completed ? XP_PER_HABIT_COMPLETION : -XP_PER_HABIT_COMPLETION;
@@ -780,9 +766,11 @@ export class DashboardRepository {
         completion_date: targetDate,
         completed: true,
         completed_at: new Date().toISOString(),
-      }, { onConflict: "habit_id,completion_date" }).select("*").single();
+      }, { onConflict: "habit_id,completion_date" })
+        .select("id, habit_id, user_id, completion_date, completed, completed_at")
+        .single();
       assertDatabaseResult(result.error);
-      completionResult = result.data;
+      completionResult = result.data!;
     } else {
       const result = await supabaseAdmin
         .from("habit_completions")
@@ -829,7 +817,6 @@ export class DashboardRepository {
   }
 
   async today(userId: string, tzOffset?: number) {
-    const goals = await new GoalRepository().list(userId);
     // Allow frontend to pass timezone offset, fallback to UTC
     let todayDate = new Date();
     if (tzOffset !== undefined) {
@@ -839,21 +826,22 @@ export class DashboardRepository {
     const today = todayDate.toISOString().slice(0, 10);
     const dayKey = scheduleDays[new Date(`${today}T00:00:00`).getDay()]!;
 
-    const completions = await supabaseAdmin
-      .from("habit_completions")
-      .select("habit_id,completed")
-      .eq("user_id", userId)
-      .eq("completion_date", today);
+    const [goals, completions, profileResult, stats] = await Promise.all([
+      new GoalRepository().list(userId),
+      supabaseAdmin
+        .from("habit_completions")
+        .select("habit_id,completed")
+        .eq("user_id", userId)
+        .eq("completion_date", today),
+      supabaseAdmin
+        .from("profiles")
+        .select("name, username, avatar_url, xp, streak_days, level")
+        .eq("id", userId)
+        .maybeSingle(),
+      this.getProgressDash(userId),
+    ]);
     assertDatabaseResult(completions.error);
-
-    const profileResult = await supabaseAdmin
-      .from("profiles")
-      .select("name, username, avatar_url, xp, streak_days, level")
-      .eq("id", userId)
-      .maybeSingle();
     assertDatabaseResult(profileResult.error);
-
-    const stats = await this.getProgressDash(userId);
     const completionMap = new Map<string, boolean>(
       (completions.data ?? []).map((row: any) => [row.habit_id, row.completed]),
     );
@@ -940,22 +928,11 @@ export class DashboardRepository {
     const today = new Date();
     const sevenDaysAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    // 1. Get basic profile
-    const profileResult = await supabaseAdmin.from("profiles")
-      .select("level, xp, streak_days")
-      .eq("id", userId)
-      .single();
-    
-    // 2. Get active goals
-    const goalsResult = await supabaseAdmin.from("goals")
-      .select("id, title, category, progress")
-      .eq("user_id", userId);
-
-    // 3. Get habit completions for the last 7 days
-    const completionsResult = await supabaseAdmin.from("habit_completions")
-      .select("completed")
-      .eq("user_id", userId)
-      .gte("completion_date", sevenDaysAgo);
+    const [profileResult, goalsResult, completionsResult] = await Promise.all([
+      supabaseAdmin.from("profiles").select("level, xp, streak_days").eq("id", userId).single(),
+      supabaseAdmin.from("goals").select("id, title, category, progress").eq("user_id", userId),
+      supabaseAdmin.from("habit_completions").select("completed").eq("user_id", userId).gte("completion_date", sevenDaysAgo),
+    ]);
 
     const profile = profileResult.data || { level: 1, xp: 0, streak_days: 0 };
     const active_goals = goalsResult.data || [];
@@ -1456,23 +1433,20 @@ export class PersonaRepository {
     const since = new Date(today.getTime() - w * 24 * 60 * 60 * 1000);
     const sinceDate = since.toISOString().slice(0, 10);
 
-    const { data: allHabits } = await supabaseAdmin
-      .from("habits")
-      .select("id, goal_id, difficulty, created_at")
-      .eq("user_id", userId);
+    const [habitsResult, goalsResult, completionsResult] = await Promise.all([
+      supabaseAdmin.from("habits").select("id, goal_id, difficulty, created_at").eq("user_id", userId),
+      supabaseAdmin.from("goals").select("id, progress").eq("user_id", userId),
+      supabaseAdmin
+        .from("habit_completions")
+        .select("habit_id, completion_date, completed")
+        .eq("user_id", userId)
+        .gte("completion_date", sinceDate),
+    ]);
+    const { data: allHabits } = habitsResult;
     const habits = (allHabits ?? []) as Array<{ id: string; goal_id: string; difficulty: string; created_at: string }>;
-
-    const { data: allGoals } = await supabaseAdmin
-      .from("goals")
-      .select("id, progress")
-      .eq("user_id", userId);
+    const { data: allGoals } = goalsResult;
     const goals = (allGoals ?? []) as Array<{ id: string; progress: number }>;
-
-    const { data: completions } = await supabaseAdmin
-      .from("habit_completions")
-      .select("habit_id, completion_date, completed")
-      .eq("user_id", userId)
-      .gte("completion_date", sinceDate);
+    const { data: completions } = completionsResult;
     const completedRows = (completions ?? []) as Array<{ habit_id: string; completion_date: string; completed: boolean }>;
     const completedTrue = completedRows.filter(r => r.completed === true);
     const completedFalse = completedRows.filter(r => r.completed === false);

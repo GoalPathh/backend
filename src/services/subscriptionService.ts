@@ -40,14 +40,13 @@ export class SubscriptionService {
     // Run fn either way (resolve or reject from prev) so a previous failure
     // doesn't poison the queue forever for that user.
     const next = prev.then(fn, fn);
-    this.activationQueues.set(
-      userId,
-      next.finally(() => {
-        if (this.activationQueues.get(userId) === next) {
-          this.activationQueues.delete(userId);
-        }
-      }),
-    );
+    const queued = next.then(() => undefined, () => undefined);
+    this.activationQueues.set(userId, queued);
+    void queued.then(() => {
+      if (this.activationQueues.get(userId) === queued) {
+        this.activationQueues.delete(userId);
+      }
+    });
     return next;
   }
 
@@ -480,10 +479,10 @@ export class SubscriptionService {
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
       .gte("created_at", startOfDay);
-    if ((count ?? 0) >= access.maxMessagesPerDay) {
+    if ((count ?? 0) >= access.maxCoachMessagesPerDay) {
       throw new AppError(
-        `Batas akses coach tercapai: ${access.accessPercentage}% akses (` +
-          `${access.maxMessagesPerDay} pesan/hari). ` +
+        `Batas akses coach tercapai: ${access.coachAccessPercentage}% akses (` +
+          `${access.maxCoachMessagesPerDay} pesan/hari). ` +
           (premium.active
             ? "Limit ini berlaku untuk semua member sebagai Fair Use Policy."
             : "Upgrade ke Premium untuk akses 100% (50 pesan/hari)."),
