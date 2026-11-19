@@ -56,6 +56,17 @@ export function initGoalMonitorJob() {
         console.log("[Goal Monitor Job] No eligible users with stagnant goals.");
         return;
       }
+      const { data: preferenceRows, error: preferenceError } = await supabaseAdmin
+        .from("user_preferences")
+        .select("*")
+        .in("user_id", userIds);
+      if (preferenceError) throw preferenceError;
+      const coachOptOuts = new Set(
+        (preferenceRows ?? [])
+          .filter((row) => (row.privacy as { personalizedCoach?: boolean } | null)?.personalizedCoach === false)
+          .map((row) => row.user_id),
+      );
+
       const { data: recent } = await supabaseAdmin
         .from("ai_intervention_log")
         .select("user_id, created_at")
@@ -68,7 +79,7 @@ export function initGoalMonitorJob() {
         recentByUser.set(row.user_id, row.created_at);
       }
 
-      const eligibleUsers = userIds.filter((uid) => !recentByUser.has(uid));
+      const eligibleUsers = userIds.filter((uid) => !recentByUser.has(uid) && !coachOptOuts.has(uid));
       console.log(`[Goal Monitor Job] ${eligibleUsers.length}/${userIds.length} users eligible (others in cooldown)`);
 
       const coachRepo = new CoachRepository();

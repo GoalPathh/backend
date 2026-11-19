@@ -25,6 +25,7 @@ export const profileSchema = z.object({ name: z.string().min(2).max(80).optional
 export const preferencesSchema = z.object({
   appearance: z.enum(["light", "dark", "system"]).optional(),
   notifications: z.array(z.object({ id: z.string(), title: z.string(), enabled: z.boolean(), description: z.string() })).optional(),
+  privacy: z.object({ personalizedCoach: z.boolean() }).optional(),
 });
 export const completionSchema = z.object({ completed: z.boolean(), completionDate: z.string().date().optional() });
 export const coachSessionUpdateSchema = z.object({ title: z.string().min(1).max(120) });

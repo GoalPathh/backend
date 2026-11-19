@@ -525,7 +525,10 @@ export class SubscriptionService {
     const tier = (row.tier as SubscriptionTier) ?? "free";
     const status = (row.status as "pending" | "active" | "expired" | "cancelled") ?? "active";
     const end = row.current_period_end ? new Date(String(row.current_period_end)) : null;
-    const isExpired = status === "active" && end ? end.getTime() <= Date.now() : status === "expired";
+    const isPaidPeriodEnded = (status === "active" || status === "cancelled")
+      && end !== null
+      && end.getTime() <= Date.now();
+    const isExpired = isPaidPeriodEnded || status === "expired";
     if (tier === "free" || isExpired) {
       return { tier: "free", status: isExpired ? "expired" : "active" };
     }

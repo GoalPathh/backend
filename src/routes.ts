@@ -252,7 +252,11 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
 
   const history = await coach.messages(userId, sessionId);
   const semanticMatches = await coach.searchContext(userId, sessionId, userEmbedding, SEMANTIC_MATCH_LIMIT);
-  const context = await dashboard.getUserContextSnapshot(userId);
+  const preferences = await users.preferences(userId);
+  const personalizedCoachEnabled = preferences.privacy?.personalizedCoach !== false;
+  const context = personalizedCoachEnabled
+    ? await dashboard.getUserContextSnapshot(userId)
+    : null;
 
   // 3. Build messages for LLM
   // We keep the last RECENT_CHAT_CONTEXT_LIMIT exchanges, plus the latest user message
@@ -267,20 +271,28 @@ apiRouter.post("/coach/sessions/:id/messages",requireUser,async(q,r)=>{
     semanticBlock = "Relevant past messages:\n" + semanticMatches.map((m: any) => `[Historical ${m.role}]: ${m.content}`).join("\n") + "\n\n";
   }
 
-  const personaContext = await persona.getCoachContext(userId, 14).catch((e) => {
-    console.warn("[coach] persona context best-effort failed:", (e as Error).message);
-    return "";
-  });
+  const personaContext = personalizedCoachEnabled
+    ? await persona.getCoachContext(userId, 14).catch((e) => {
+        console.warn("[coach] persona context best-effort failed:", (e as Error).message);
+        return "";
+      })
+    : "";
+
+  const accountDataBlock = personalizedCoachEnabled
+    ? JSON.stringify(context, null, 2)
+    : "The user has disabled goal and activity personalization. Do not use or imply knowledge of saved goals, habits, milestones, progress, schedules, or persona. Use only information shared in this conversation.";
 
   const systemPrompt = `You are a smart AI Coach for GoalPath.
 You help users plan goals and maintain habits.
 
 ${personaContext ? `<PersonaContext>\n${personaContext}\n</PersonaContext>\n` : ""}${semanticBlock}Current User Data (STRICT SOURCE OF TRUTH):
-${JSON.stringify(context, null, 2)}
+${accountDataBlock}
 
 Rules:
-- Adapt your tone to the user's persona archetype above — keep the tone matched to ${personaContext ? "their style. " : "their context."}Mention suggested next milestone in passing when appropriate; never override the user's stated choices.
+- When the personalization preference is off, rely only on the current conversation and its retained messages; do not infer account goals, habits, milestones, progress, schedules, or persona from account data.
+- Adapt your tone to the user's persona archetype above when personalization is enabled — keep the tone matched to ${personaContext ? "their style. " : "their context."} Mention a suggested next milestone when appropriate; never override the user's stated choices.
 - DO NOT hallucinate dates or progress.
+- If personalization is disabled, do not refer to saved goals, activity, persona, or suggested milestones unless the user mentions them in the current conversation.
 - When user expresses INTENT to set up a new goal (eg. "bikin goal baru", "I want to track", "mau mulai fitness 3 bulan", "let's set a goal", "set up a goal", "saya mau belajar Spanish"), call the start_goal_wizard tool — even if some details are missing. Pass any details the user mentioned as parameters; leave others null. After this tool call, briefly tell the user you'll open the wizard.
 - Otherwise, when the goal is mostly planned and you have title + category, call the createGoal tool directly.
 - When user wants to update a goal, call the updateGoal tool.
@@ -369,6 +381,10 @@ apiRouter.get("/subscription", requireUser, async (q, r) => {
   // Fast read endpoint — no Midtrans GET, just emit the current DB state.
   // Reconcile happens lazily via POST /subscription/refresh.
   return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
+});
+
+apiRouter.get("/subscription/payments", requireUser, async (q, r) => {
+  return r.json({ data: await subscriptions.listPayments(q.userId!) });
 });
 
 apiRouter.post("/subscription/checkout", requireUser, async (q, r) => {

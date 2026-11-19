@@ -279,6 +279,7 @@ export class UserRepository {
     return {
       user_id: userId,
       appearance: "light",
+      privacy: { personalizedCoach: true },
       notifications: [
         { id: "daily-habit", title: "Daily Habit Reminders", enabled: true, description: "Stay on track with daily check-ins." },
         { id: "progress-updates", title: "Goal Progress Updates", enabled: true, description: "Get updates when goals move forward." },
@@ -288,7 +289,7 @@ export class UserRepository {
       ],
     };
   }
-  async updatePreferences(userId:string,input:any) { const result=await supabaseAdmin.from("user_preferences").upsert({user_id:userId,...(input.appearance!==undefined&&{appearance:input.appearance}),...(input.notifications!==undefined&&{notifications:input.notifications}),updated_at:new Date().toISOString()}).select("*").single(); assertDatabaseResult(result.error); return result.data; }
+  async updatePreferences(userId:string,input:any) { const result=await supabaseAdmin.from("user_preferences").upsert({user_id:userId,...(input.appearance!==undefined&&{appearance:input.appearance}),...(input.notifications!==undefined&&{notifications:input.notifications}),...(input.privacy!==undefined&&{privacy:input.privacy}),updated_at:new Date().toISOString()}).select("*").single(); assertDatabaseResult(result.error); return result.data; }
   createAvatarUploadSignature(userId: string) {
     if (!config.cloudinaryCloudName || !config.cloudinaryApiKey || !config.cloudinaryApiSecret) {
       throw new AppError("Cloudinary upload is not configured on the server.", 503);
