@@ -25,6 +25,7 @@ import { currentDriver } from "./llm-dispatcher.js";
 import { GoalRepository, UserRepository } from "./repositories.js";
 import { AppError } from "./errors.js";
 import { generateEmbedding } from "./services/embeddings.js";
+import { ProgressAdaptationService } from "./services/progressAdaptationService.js";
 
 const setAuthCookies = (res: any, data: any) => {
   if (data?.session) {
@@ -44,6 +45,13 @@ const setAuthCookies = (res: any, data: any) => {
 };
 
 export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(),subscriptions=new SubscriptionFacade(); const id=z.string().uuid();
+const progressAdaptation = new ProgressAdaptationService();
+const adaptationChangesSchema = z.object({
+  title: z.string().trim().min(1).max(120).optional(),
+  duration: z.number().int().min(1).max(1440).optional(),
+  timeRange: z.enum(["anytime", "morning", "afternoon", "evening"]).optional(),
+  activeDays: z.array(z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"])).max(7).optional(),
+}).strict();
 apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
 apiRouter.post("/auth/register",async(q,r)=>{const data=await auth.register(registerSchema.parse(q.body));setAuthCookies(r,data);r.status(201).json({data})});
 apiRouter.post("/auth/login",async(q,r)=>{const data=await auth.login(authSchema.parse(q.body));setAuthCookies(r,data);r.json({data})});
@@ -119,6 +127,22 @@ apiRouter.get("/progress",requireUser,async(q,r)=>r.json({data:await dashboard.g
 apiRouter.get("/progress/overview",requireUser,async(q,r)=>{const {range}=progressRangeSchema.parse(q.query);r.json({data:await dashboard.progressOverview(q.userId!,range)});});
 apiRouter.get("/progress/dash",requireUser,async(q,r)=>r.json({data:await dashboard.progressDash(q.userId!)}));
 apiRouter.get("/progress/goals",requireUser,async(q,r)=>r.json({data:await dashboard.goalPerformance(q.userId!)}));
+apiRouter.get("/progress/adaptation",requireUser,async(q,r)=>{
+  const { range } = progressRangeSchema.parse(q.query);
+  const goalId = q.query.goalId ? id.parse(q.query.goalId) : undefined;
+  return r.json({data:await progressAdaptation.get(q.userId!,range,goalId)});
+});
+apiRouter.post("/progress/adaptation/:id/apply",requireUser,async(q,r)=>{
+  const changes = adaptationChangesSchema.parse(q.body);
+  return r.json({data:await progressAdaptation.apply(
+    q.userId!,
+    id.parse(q.params.id),
+    Object.keys(changes).length ? changes : undefined,
+  )});
+});
+apiRouter.post("/progress/adaptation/:id/dismiss",requireUser,async(q,r)=>
+  r.json({data:await progressAdaptation.dismiss(q.userId!,id.parse(q.params.id))}),
+);
 apiRouter.post("/progress/recompute/:goalId",requireUser,async(q,r)=>{const goalId=z.string().uuid().parse(q.params.goalId);return r.json({data:await dashboard.recomputeGoal(q.userId!,goalId)});});
 apiRouter.get("/progress/persona",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse(q.query.windowDays);return r.json({data:await persona.compute(q.userId!,w)});});
 apiRouter.post("/progress/persona/refresh",requireUser,async(q,r)=>{const w=personaWindowDaysSchema.parse((q.body&&(q.body as any).windowDays)||q.query.windowDays);return r.json({data:await persona.compute(q.userId!,w,true)});});

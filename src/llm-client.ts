@@ -406,6 +406,20 @@ export async function agentChat(systemPrompt: string, messages: any[], userId: s
 }
 
 // ── Milestone suggestion (used by wizard step "schedule" in coach flow) ──
+export async function generateProgressNarrative(payload: Record<string, unknown>): Promise<string> {
+  const systemPrompt = `You are GoalPath's progress analyst. Use only the supplied progress data. Write one concise, supportive paragraph with a concrete observation and next step. Do not invent metrics or dates. Return plain text only, in the language of the goal title when provided.`;
+  const userMessage = JSON.stringify(payload, null, 2) ?? "{}";
+  const text = config.llmDriver === "vercel"
+    ? await agentChatVercel(systemPrompt, [{ role: "user", content: userMessage }])
+    : stripReasoning((await fetchLLM([
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ], [])).message?.content ?? "");
+
+  if (!text.trim()) throw new Error("The progress narrative was empty.");
+  return text.trim();
+}
+
 export interface SuggestedMilestone {
   title: string;
   target_date?: string; // ISO date
