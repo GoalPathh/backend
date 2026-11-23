@@ -115,3 +115,4 @@ Seluruh test case (TC01 s/d TC09) telah dieksekusi secara nyata terhadap server 
 | **TC09** | Admin mengakses statistik administratif sistem | ADMIN | `GET /admin/stats` | 200 | 200 | **PASS** |
 
 Dokumentasi lengkap log respons JSON dari masing-masing test case dapat dilihat pada berkas `test-results.md`.
+
