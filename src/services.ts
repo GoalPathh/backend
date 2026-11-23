@@ -74,6 +74,7 @@ export class AuthService {
       user: {
         id: user.id,
         email: user.email,
+        role: user.role,
         user_metadata: { name: user.profile?.name, username: user.profile?.username },
       },
       session,
@@ -100,6 +101,7 @@ export class AuthService {
       user: {
         id: user.id,
         email: user.email,
+        role: user.role,
         user_metadata: { name: user.profile?.name, username: user.profile?.username },
       },
       session,
@@ -123,6 +125,7 @@ export class AuthService {
         user: {
           id: user.id,
           email: user.email,
+          role: user.role,
           user_metadata: { name: user.profile?.name, username: user.profile?.username },
         },
         session,
@@ -266,6 +269,99 @@ export class SubscriptionFacade {
   assertCanCreateHabit(userId: string, goalId: string) { return this.service.assertCanCreateHabit(userId, goalId); }
   assertCanSendCoachMessage(userId: string) { return this.service.assertCanSendCoachMessage(userId); }
   assertPremium(userId: string) { return this.service.assertPremium(userId); }
+}
+
+// ─── AdminService ───────────────────────────────────────────────────────────────
+// Hanya operasi administratif yang aman: tidak mengekspos password_hash,
+// tidak mengakses data privat (goal, habit, AI session) milik user.
+export class AdminService {
+  /**
+   * Daftar semua user (hanya field administratif, tanpa data privat).
+   */
+  async listUsers(page = 1, limit = 20) {
+    const skip = (page - 1) * limit;
+    const [users, total] = await Promise.all([
+      prisma.user.findMany({
+        skip,
+        take: limit,
+        orderBy: { created_at: "desc" },
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          email_verified: true,
+          created_at: true,
+          updated_at: true,
+          profile: {
+            select: { name: true, username: true, avatar_url: true, level: true, xp: true },
+          },
+          subscription: {
+            select: { tier: true, status: true },
+          },
+        },
+      }),
+      prisma.user.count(),
+    ]);
+    return { users, total, page, limit, totalPages: Math.ceil(total / limit) };
+  }
+
+  /**
+   * Detail satu user (field administratif saja).
+   */
+  async getUser(userId: string) {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        email_verified: true,
+        created_at: true,
+        updated_at: true,
+        profile: {
+          select: { name: true, username: true, avatar_url: true, level: true, xp: true, streak_days: true },
+        },
+        subscription: {
+          select: { tier: true, status: true, current_period_end: true },
+        },
+        _count: {
+          select: { goals: true, habits: true, coach_sessions: true },
+        },
+      },
+    });
+    if (!user) throw new AppError("User not found.", 404);
+    return user;
+  }
+
+  /**
+   * Ubah role user. Hanya USER <-> ADMIN yang diizinkan.
+   * Tidak ada endpoint publik untuk ini — hanya bisa diakses ADMIN.
+   */
+  async updateRole(targetUserId: string, newRole: "USER" | "ADMIN") {
+    if (!["USER", "ADMIN"].includes(newRole)) {
+      throw new AppError("Role tidak valid. Gunakan USER atau ADMIN.", 400);
+    }
+    const user = await prisma.user.update({
+      where: { id: targetUserId },
+      data: { role: newRole as any },
+      select: { id: true, email: true, role: true },
+    });
+    return user;
+  }
+
+  /**
+   * Statistik sistem untuk dashboard admin.
+   */
+  async systemStats() {
+    const [totalUsers, totalGoals, totalHabits, totalSessions, premiumUsers] = await Promise.all([
+      prisma.user.count(),
+      prisma.goal.count(),
+      prisma.habit.count(),
+      prisma.coachSession.count(),
+      prisma.subscription.count({ where: { tier: "premium", status: "active" } }),
+    ]);
+    return { totalUsers, totalGoals, totalHabits, totalSessions, premiumUsers };
+  }
 }
 
 export { SubscriptionRepository };

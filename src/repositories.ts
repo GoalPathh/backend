@@ -297,30 +297,40 @@ export class GoalRepository {
 
 export class UserRepository {
   async profile(userId: string) {
-    const profile = await prisma.profile.findUnique({
+    const user = await prisma.user.findUnique({
       where: { id: userId },
+      select: { email: true, role: true },
     });
-    if (profile) return profile;
-
-    const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new AppError("Profile not found.", 404);
 
-    const email = user.email;
-    const name = email.split("@")[0] || "GoalPath User";
-    const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]+/g, "") || "goalpath";
-    const username = `@${usernameBase}`;
-
-    return prisma.profile.create({
-      data: {
-        id: userId,
-        name,
-        username,
-        avatar_url: "",
-        xp: 0,
-        streak_days: 0,
-        level: 1,
-      },
+    let profile = await prisma.profile.findUnique({
+      where: { id: userId },
     });
+
+    if (!profile) {
+      const email = user.email;
+      const name = email.split("@")[0] || "GoalPath User";
+      const usernameBase = name.toLowerCase().replace(/[^a-z0-9_]+/g, "") || "goalpath";
+      const username = `@${usernameBase}`;
+
+      profile = await prisma.profile.create({
+        data: {
+          id: userId,
+          name,
+          username,
+          avatar_url: "",
+          xp: 0,
+          streak_days: 0,
+          level: 1,
+        },
+      });
+    }
+
+    return {
+      ...profile,
+      email: user.email,
+      role: user.role,
+    };
   }
 
   async updateProfile(userId: string, input: any) {

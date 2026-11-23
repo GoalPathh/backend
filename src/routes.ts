@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { requirePremium, requireUser } from "./middleware.js";
+import { requireOwnership, requirePremium, requireRole, requireUser } from "./middleware.js";
 import {
   authSchema,
   completionSchema,
@@ -19,7 +19,7 @@ import {
   updateGoalSchema,
   wizardGoalPayloadSchema,
 } from "./schemas.js";
-import { AuthService, CoachService, DashboardService, GoalService, MilestoneService, NotificationService, PersonaService, SubscriptionFacade, UserService } from "./services.js";
+import { AdminService, AuthService, CoachService, DashboardService, GoalService, MilestoneService, NotificationService, PersonaService, SubscriptionFacade, UserService } from "./services.js";
 import { agentChat, agentSuggestMilestones } from "./llm-client.js";
 import { currentDriver } from "./llm-dispatcher.js";
 import { GoalRepository, UserRepository } from "./repositories.js";
@@ -43,7 +43,7 @@ const setAuthCookies = (res: any, data: any) => {
   }
 };
 
-export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(),subscriptions=new SubscriptionFacade(); const id=z.string().uuid();
+export const apiRouter=Router(); const auth=new AuthService(),goals=new GoalService(),users=new UserService(),dashboard=new DashboardService(),notifications=new NotificationService(),coach=new CoachService(),milestones=new MilestoneService(),persona=new PersonaService(),subscriptions=new SubscriptionFacade(),admin=new AdminService(); const id=z.string().uuid();
 apiRouter.get("/health",(_q,r)=>r.json({data:{status:"ok",service:"goalpath-api",llm_driver:currentDriver()}}));
 apiRouter.post("/auth/register",async(q,r)=>{const data=await auth.register(registerSchema.parse(q.body));setAuthCookies(r,data);r.status(201).json({data})});
 apiRouter.post("/auth/login",async(q,r)=>{const data=await auth.login(authSchema.parse(q.body));setAuthCookies(r,data);r.json({data})});
@@ -54,13 +54,13 @@ apiRouter.post("/auth/forgot-password",async(q,r)=>r.json({data:await auth.forgo
 apiRouter.post("/auth/password",requireUser,async(q,r)=>r.json({data:await auth.updatePassword(q.userId!,updatePasswordSchema.parse(q.body).password)}));
 apiRouter.get("/goals",requireUser,async(q,r)=>r.json({data:await goals.list(q.userId!)}));
 apiRouter.get("/goals/dashboard",requireUser,async(q,r)=>r.json({data:await goals.dashboard(q.userId!)}));
-apiRouter.get("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.get(q.userId!,id.parse(q.params.id))}));
+apiRouter.get("/goals/:id",requireUser,requireOwnership("goal"),async(q,r)=>r.json({data:await goals.get(q.userId!,id.parse(q.params.id))}));
 apiRouter.post("/goals",requireUser,async(q,r)=>{
   await subscriptions.assertCanCreateGoal(q.userId!);
   return r.status(201).json({data:await goals.create(q.userId!,goalSchema.parse(q.body))});
 });
-apiRouter.patch("/goals/:id",requireUser,async(q,r)=>r.json({data:await goals.update(q.userId!,id.parse(q.params.id),updateGoalSchema.parse(q.body))}));
-apiRouter.delete("/goals/:id",requireUser,async(q,r)=>{await goals.remove(q.userId!,id.parse(q.params.id));r.status(204).send()});
+apiRouter.patch("/goals/:id",requireUser,requireOwnership("goal"),async(q,r)=>r.json({data:await goals.update(q.userId!,id.parse(q.params.id),updateGoalSchema.parse(q.body))}));
+apiRouter.delete("/goals/:id",requireUser,requireOwnership("goal"),async(q,r)=>{await goals.remove(q.userId!,id.parse(q.params.id));r.status(204).send()});
 apiRouter.get("/me/overview",requireUser,async(q,r)=>r.json({data:await users.overview(q.userId!)}));
 apiRouter.get("/me",requireUser,async(q,r)=>r.json({data:await users.profile(q.userId!)}));
 apiRouter.patch("/me",requireUser,async(q,r)=>r.json({data:await users.updateProfile(q.userId!,profileSchema.parse(q.body))}));
@@ -394,4 +394,27 @@ apiRouter.post("/subscription/refresh", requireUser, async (q, r) => {
 apiRouter.post("/subscription/cancel", requireUser, async (q, r) => {
   await subscriptions.cancel(q.userId!);
   return r.json({ data: await subscriptions.getMySubscription(q.userId!) });
+});
+
+// ── Admin routes ──
+// Dilindungi penuh oleh requireUser dan requireRole("ADMIN").
+// Hanya user dengan role ADMIN yang dapat mengakses endpoint ini.
+apiRouter.get("/admin/stats", requireUser, requireRole("ADMIN"), async (_q, r) => {
+  return r.json({ data: await admin.systemStats() });
+});
+
+apiRouter.get("/admin/users", requireUser, requireRole("ADMIN"), async (q, r) => {
+  const page = q.query.page ? Math.max(1, parseInt(q.query.page as string, 10)) : 1;
+  const limit = q.query.limit ? Math.min(100, Math.max(1, parseInt(q.query.limit as string, 10))) : 20;
+  return r.json({ data: await admin.listUsers(page, limit) });
+});
+
+apiRouter.get("/admin/users/:id", requireUser, requireRole("ADMIN"), async (q, r) => {
+  return r.json({ data: await admin.getUser(id.parse(q.params.id)) });
+});
+
+apiRouter.patch("/admin/users/:id/role", requireUser, requireRole("ADMIN"), async (q, r) => {
+  const roleBody = z.object({ role: z.enum(["USER", "ADMIN"]) }).parse(q.body);
+  const updated = await admin.updateRole(id.parse(q.params.id), roleBody.role);
+  return r.json({ data: updated });
 });
