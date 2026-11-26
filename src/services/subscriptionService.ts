@@ -4,6 +4,7 @@ import { AppError } from "../errors.js";
 import {
   FREE_LIMITS,
   PLAN_MATRIX,
+  PREMIUM_TRIAL_DAYS,
   resolveCoachAccess,
   type SubscriptionResponse,
   type SubscriptionTier,
@@ -51,14 +52,91 @@ export class SubscriptionService {
   }
 
   async getMySubscription(userId: string): Promise<SubscriptionResponse> {
-    const row = await this.fetchSubscriptionRow(userId);
+    const subscriptionResult = await supabaseAdmin
+      .from("subscriptions")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (subscriptionResult.error) {
+      throw new AppError(`Failed to fetch subscription: ${subscriptionResult.error.message}`, 500);
+    }
+    const row = (subscriptionResult.data ?? null) as Record<string, unknown> | null;
+    let trialEligible = row === null;
+    if (trialEligible) {
+      const previousPayment = await supabaseAdmin
+        .from("payment_transactions")
+        .select("order_id")
+        .eq("user_id", userId)
+        .eq("status", "settlement")
+        .limit(1);
+      if (previousPayment.error) {
+        throw new AppError(`Failed to check Premium history: ${previousPayment.error.message}`, 500);
+      }
+      trialEligible = !previousPayment.data?.length;
+    }
     const { tier, status } = this.resolveEffectiveTier(row);
     const matrix = PLAN_MATRIX[tier];
+    const metadata = row?.metadata && typeof row.metadata === "object"
+      ? row.metadata as Record<string, unknown>
+      : {};
+    const isTrial = typeof metadata.trialStartedAt === "string" && !row?.last_payment_order_id;
 
     return {
       tier,
       status,
       currentPeriodEnd: typeof row?.current_period_end === "string" ? row.current_period_end : null,
+      trialEligible,
+      isTrial,
+      trialPeriodDays: PREMIUM_TRIAL_DAYS,
+      limits: matrix.limits,
+      features: matrix.features,
+      premiumPriceIdr: config.premiumPriceIdr,
+      premiumPeriodDays: config.premiumPeriodDays,
+    };
+  }
+
+  async startTrial(userId: string): Promise<SubscriptionResponse> {
+    const current = await supabaseAdmin
+      .from("subscriptions")
+      .select("user_id")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (current.error) throw new AppError(`Failed to check trial eligibility: ${current.error.message}`, 500);
+    if (current.data) throw new AppError("Premium trial is only available to accounts that have never had Premium.", 409);
+
+    const previousPayment = await supabaseAdmin
+      .from("payment_transactions")
+      .select("order_id")
+      .eq("user_id", userId)
+      .eq("status", "settlement")
+      .limit(1);
+    if (previousPayment.error) throw new AppError(`Failed to check Premium history: ${previousPayment.error.message}`, 500);
+    if (previousPayment.data?.length) throw new AppError("Premium trial is only available to accounts that have never had Premium.", 409);
+
+    const startedAt = new Date();
+    const endsAt = new Date(startedAt.getTime() + PREMIUM_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+    const result = await supabaseAdmin.from("subscriptions").insert({
+      user_id: userId,
+      tier: "premium",
+      status: "active",
+      current_period_start: startedAt.toISOString(),
+      current_period_end: endsAt.toISOString(),
+      auto_renew: false,
+      metadata: { trialStartedAt: startedAt.toISOString() },
+    });
+    if (result.error?.code === "23505") {
+      throw new AppError("Premium trial has already been used.", 409);
+    }
+    if (result.error) throw new AppError(`Failed to start Premium trial: ${result.error.message}`, 500);
+
+    const matrix = PLAN_MATRIX.premium;
+    return {
+      tier: "premium",
+      status: "active",
+      currentPeriodEnd: endsAt.toISOString(),
+      trialEligible: false,
+      isTrial: true,
+      trialPeriodDays: PREMIUM_TRIAL_DAYS,
       limits: matrix.limits,
       features: matrix.features,
       premiumPriceIdr: config.premiumPriceIdr,

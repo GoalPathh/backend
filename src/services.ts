@@ -85,6 +85,7 @@ export class SubscriptionFacade {
   ) {}
 
   getMySubscription(userId: string) { return this.service.getMySubscription(userId); }
+  startTrial(userId: string) { return this.service.startTrial(userId); }
   listPayments(userId: string) { return new SubscriptionRepository().listPaymentsForUser(userId); }
   isPremiumActive(userId: string) { return this.service.isPremiumActive(userId); }
   createCheckout(userId: string, profile: { name?: string | null; email?: string | null }) {

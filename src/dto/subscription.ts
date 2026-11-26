@@ -5,6 +5,7 @@
 
 export type SubscriptionTier = "free" | "premium";
 export type SubscriptionStatus = "pending" | "active" | "expired" | "cancelled";
+export const PREMIUM_TRIAL_DAYS = 7;
 
 /**
  * Numeric limits for the free tier. Premium uses `null` (meaning unlimited).
@@ -81,6 +82,9 @@ export interface SubscriptionResponse {
   tier: SubscriptionTier;
   status: SubscriptionStatus;
   currentPeriodEnd: string | null;
+  trialEligible: boolean;
+  isTrial: boolean;
+  trialPeriodDays: number;
   /** resolved limits driven by current effective tier */
   limits: SubscriptionLimits;
   /** resolved features driven by current effective tier */

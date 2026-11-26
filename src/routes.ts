@@ -411,6 +411,10 @@ apiRouter.get("/subscription/payments", requireUser, async (q, r) => {
   return r.json({ data: await subscriptions.listPayments(q.userId!) });
 });
 
+apiRouter.post("/subscription/trial", requireUser, async (q, r) => {
+  return r.status(201).json({ data: await subscriptions.startTrial(q.userId!) });
+});
+
 apiRouter.post("/subscription/checkout", requireUser, async (q, r) => {
   const profile = await new UserRepository().profile(q.userId!);
   const fallbackName = typeof (profile as any)?.name === "string" ? (profile as any).name : "GoalPath";

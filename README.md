@@ -31,7 +31,13 @@ API berbasis Express + TypeScript yang didukung oleh Supabase PostgreSQL, Supaba
 Base URL API: `http://localhost:4000/api/v1`.  
 Request yang butuh autentikasi menggunakan header `Authorization: Bearer <supabase_jwt>`. Variabel `DEFAULT_USER_ID` hanya aktif di mode _development_.
 
-## 🗺️ Main Routes (Rute Utama)
+## Dokumentasi API (Swagger)
+
+Setelah backend berjalan, buka Swagger UI di http://localhost:4000/api/docs. Spesifikasi OpenAPI tersedia di http://localhost:4000/api/openapi.json.
+
+Gunakan tombol **Authorize** di Swagger UI untuk memasukkan JWT Supabase. API juga mendukung cookie goalpath_access_token yang diatur otomatis oleh endpoint login dan register.
+
+## Main Routes (Rute Utama)
 
 | Method | Path | Tujuan |
 |---|---|---|
